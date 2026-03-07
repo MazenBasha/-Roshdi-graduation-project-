@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Wake Word Dataset Cleaner</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Segoe UI, Arial, sans-serif;
+      background: #f7f8fa;
+      color: #1f2937;
+    }
+
+    .wrap {
+      max-width: 760px;
+      margin: 32px auto;
+      padding: 24px;
+      background: #ffffff;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.05);
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 24px;
+    }
+
+    .meta {
+      margin: 6px 0;
+      color: #4b5563;
+      font-size: 14px;
+      word-break: break-all;
+    }
+
+    .status {
+      margin-top: 12px;
+      min-height: 24px;
+      font-weight: 600;
+    }
+
+    audio {
+      width: 100%;
+      margin-top: 14px;
+    }
+
+    .buttons {
+      margin-top: 16px;
+      display: none;
+      gap: 12px;
+    }
+
+    button {
+      border: none;
+      border-radius: 10px;
+      padding: 12px 18px;
+      font-size: 16px;
+      cursor: pointer;
+      color: white;
+    }
+
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    .positive {
+      background: #16a34a;
+    }
+
+    .negative {
+      background: #dc2626;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Wake Word Dataset Cleaner</h1>
+    <div class="meta" id="fileName">File: -</div>
+    <div class="meta" id="counts">Remaining: -</div>
+
+    <audio id="player" controls preload="auto"></audio>
+
+    <div class="buttons" id="labelButtons">
+      <button class="positive" id="btnPositive">Positive</button>
+      <button class="negative" id="btnNegative">Negative</button>
+    </div>
+
+    <div class="status" id="status">Loading first sample...</div>
+  </div>
+
+  <script>
+    const player = document.getElementById("player");
+    const statusEl = document.getElementById("status");
+    const fileNameEl = document.getElementById("fileName");
+    const countsEl = document.getElementById("counts");
+    const labelButtons = document.getElementById("labelButtons");
+    const btnPositive = document.getElementById("btnPositive");
+    const btnNegative = document.getElementById("btnNegative");
+
+    const userIdKey = "wake_cleaner_user_id";
+    let userId = localStorage.getItem(userIdKey);
+    if (!userId) {
+      userId = crypto.randomUUID();
+      localStorage.setItem(userIdKey, userId);
+    }
+
+    let currentToken = null;
+
+    function setButtonsEnabled(enabled) {
+      btnPositive.disabled = !enabled;
+      btnNegative.disabled = !enabled;
+    }
+
+    function showButtons(show) {
+      labelButtons.style.display = show ? "flex" : "none";
+    }
+
+    function updateCounts(counts) {
+      if (!counts) {
+        countsEl.textContent = "Remaining: -";
+        return;
+      }
+      countsEl.textContent = `Remaining: ${counts.remaining} | Raw: ${counts.raw} | In Progress: ${counts.in_progress} | Positive: ${counts.positive} | Negative: ${counts.negative}`;
+    }
+
+    async function loadNext() {
+      showButtons(false);
+      setButtonsEnabled(false);
+      statusEl.textContent = "Loading next sample...";
+
+      try {
+        const res = await fetch(`/next?user_id=${encodeURIComponent(userId)}`);
+        const data = await res.json();
+
+        updateCounts(data.counts);
+
+        if (!res.ok) {
+          statusEl.textContent = data.error || "Failed to load next sample.";
+          currentToken = null;
+          fileNameEl.textContent = "File: -";
+          return;
+        }
+
+        if (!data.has_sample) {
+          statusEl.textContent = data.message || "No more files.";
+          currentToken = null;
+          fileNameEl.textContent = "File: -";
+          player.removeAttribute("src");
+          player.load();
+          return;
+        }
+
+        currentToken = data.token;
+        fileNameEl.textContent = `File: ${data.display_name}`;
+
+        // Cache-bust in case browser reused previous token stream.
+        player.src = `${data.audio_url}?t=${Date.now()}`;
+        player.load();
+
+        statusEl.textContent = "Playing...";
+        const playPromise = player.play();
+        if (playPromise) {
+          playPromise.catch(() => {
+            statusEl.textContent = "Autoplay blocked by browser. Press Play, then label.";
+          });
+        }
+      } catch (err) {
+        statusEl.textContent = `Error: ${err.message}`;
+      }
+    }
+
+    async function sendLabel(label) {
+      if (!currentToken) {
+        return;
+      }
+
+      setButtonsEnabled(false);
+      statusEl.textContent = `Saving as ${label}...`;
+
+      try {
+        const res = await fetch("/label", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token: currentToken, label, user_id: userId })
+        });
+
+        const data = await res.json();
+        updateCounts(data.counts);
+
+        if (!res.ok) {
+          statusEl.textContent = data.error || "Failed to save label.";
+          showButtons(true);
+          setButtonsEnabled(true);
+          return;
+        }
+
+        currentToken = null;
+        await loadNext();
+      } catch (err) {
+        statusEl.textContent = `Error: ${err.message}`;
+        showButtons(true);
+        setButtonsEnabled(true);
+      }
+    }
+
+    player.addEventListener("ended", () => {
+      if (!currentToken) {
+        return;
+      }
+      statusEl.textContent = "Choose label.";
+      showButtons(true);
+      setButtonsEnabled(true);
+    });
+
+    btnPositive.addEventListener("click", () => sendLabel("positive"));
+    btnNegative.addEventListener("click", () => sendLabel("negative"));
+
+    // Keyboard shortcuts: 1 = Positive, 2 = Negative
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "1" && !btnPositive.disabled) {
+        sendLabel("positive");
+      } else if (e.key === "2" && !btnNegative.disabled) {
+        sendLabel("negative");
+      }
+    });
+
+    loadNext();
+  </script>
+</body>
+</html>
