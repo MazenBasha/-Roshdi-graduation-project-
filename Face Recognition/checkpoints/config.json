@@ -1,0 +1,11 @@
+{
+  "num_epochs": 50,
+  "batch_size": 32,
+  "learning_rate": 0.001,
+  "num_classes": 5749,
+  "embedding_size": 128,
+  "input_size": 112,
+  "arcface_margin": 0.5,
+  "arcface_scale": 64,
+  "training_date": "2026-03-07T03:06:51.169577"
+}

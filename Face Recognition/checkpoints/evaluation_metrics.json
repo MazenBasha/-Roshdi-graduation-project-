@@ -1,0 +1,10 @@
+{
+  "accuracy": 0.03947916666666667,
+  "precision": 0.03072077181395806,
+  "recall": 0.03947916666666667,
+  "f1_score": 0.03173721167191459,
+  "num_test_samples": 28800,
+  "num_classes": 400,
+  "intra_class_distance_mean": 0.381221204996109,
+  "inter_class_distance": 0.8384984135627747
+}

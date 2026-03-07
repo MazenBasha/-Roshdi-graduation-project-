@@ -1,0 +1,12 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Train model on LFW dataset",
+			"type": "shell",
+			"command": "python train_sampled_digiface.py --data_dir lfw_funneled --val_dir lfw_funneled --output_dir experiments/lfw_test --epochs 10 --batch_size 32 --lr 0.001 --patience 3",
+			"isBackground": false,
+			"group": "build"
+		}
+	]
+}
