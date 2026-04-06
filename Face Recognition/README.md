@@ -17,6 +17,13 @@ Recognition:
 
 Export to TFLite:
     python export_tflite.py --model_path checkpoints/backbone.h5 --output_path embedding_model.tflite --quantize True
+
+Live Camera Test:
+    python camera_test.py
+
+Controls (camera window):
+    q = quit
+    r = register current face embedding (then type a name in the terminal)
 # Face Recognition from Scratch
 
 A complete, production-ready face recognition system built from scratch using TensorFlow/Keras. Designed for mobile deployment with a lightweight MobileFaceNet-inspired architecture and ArcFace loss.
