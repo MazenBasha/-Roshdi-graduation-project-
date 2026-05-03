@@ -1,0 +1,31 @@
+name: rushdey
+description: "A new Flutter project."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  shared_preferences: ^2.2.2
+  pytorch_lite: ^4.3.2
+  image: ^4.1.7
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/models/wake_word_trial2.ptl
+    - assets/models/config.json
+    - assets/models/face_model.tflite
+    - assets/models/currency_model.ptl
+    - assets/models/best.ptl
+    - assets/models/labels.txt

@@ -1,0 +1,92 @@
+{
+  "model_info": {
+    "name": "Wake Word Detector - Trial 2",
+    "trial": 2,
+    "architecture": "AttentionWakeWordCNN",
+    "wake_word": "رشدي",
+    "language": "Arabic",
+    "version": "2.0-ptl",
+    "target": "Flutter Android (PyTorch Lite)"
+  },
+  "files": {
+    "ptl_model": "wake_word_trial2.ptl",
+    "torchscript_model": "wake_word_trial2.pt",
+    "pytorch_weights": "wake_word_trial2_model_only.pth",
+    "full_checkpoint": "wake_word_trial2_full.pth",
+    "config_file": "config.json"
+  },
+  "model_input": {
+    "shape": [
+      1,
+      1,
+      64,
+      32
+    ],
+    "dtype": "float32",
+    "tensor_order": "NCHW",
+    "input_tensor_name": "input"
+  },
+  "model_output": {
+    "shape": [
+      1,
+      2
+    ],
+    "dtype": "float32",
+    "output_tensor_name": "output",
+    "classes": [
+      "negative",
+      "wake_word"
+    ]
+  },
+  "audio_preprocessing": {
+    "sample_rate": 16000,
+    "duration_seconds": 1.0,
+    "expected_samples": 16000,
+    "n_mels": 64,
+    "n_fft": 1024,
+    "hop_length": 512,
+    "fmin": 20,
+    "fmax": 8000,
+    "expected_feature_shape": [
+      64,
+      32
+    ],
+    "normalization": "(mel - mean) / std"
+  },
+  "inference": {
+    "threshold": 0.5,
+    "positive_class_index": 1,
+    "postprocess": [
+      "Apply softmax to output logits",
+      "Read probability at index 1",
+      "Detect wake word if probability > 0.5"
+    ]
+  },
+  "flutter_android": {
+    "asset_path_suggestion": "assets/models/wake_word_trial2.ptl",
+    "runtime": "pytorch_lite",
+    "notes": [
+      "Add the .ptl file under Flutter assets",
+      "Declare assets in pubspec.yaml",
+      "Use the same mel preprocessing used during training",
+      "Input tensor must be float32 with shape [1, 1, 64, 32]"
+    ]
+  },
+  "performance_metrics": {
+    "test_accuracy_percent": 73.68,
+    "wake_word_precision": 0.6545,
+    "wake_word_recall": 0.766,
+    "wake_word_f1": 0.7059,
+    "confusion_matrix": {
+      "true_negatives": 48,
+      "false_positives": 19,
+      "false_negatives": 11,
+      "true_positives": 36
+    }
+  },
+  "metadata": {
+    "framework": "PyTorch",
+    "pytorch_version": "2.10.0+cu130",
+    "export_format": "ptl"
+  }
+}
