@@ -1,0 +1,21 @@
+{
+  "data": "data/digiface_smoke",
+  "backbone": "iresnet18",
+  "embedding_dim": 512,
+  "epochs": 3,
+  "batch_size": 32,
+  "num_workers": 0,
+  "lr": 0.05,
+  "momentum": 0.9,
+  "weight_decay": 0.0005,
+  "warmup_epochs": 1,
+  "scale": 64.0,
+  "margin": 0.5,
+  "val_fraction": 0.1,
+  "min_samples_per_class": 5,
+  "resume": "",
+  "output": "checkpoints/smoke_iresnet18.pt",
+  "log_dir": "/Users/jilan/Desktop/Face Recognition Gilan/logs",
+  "seed": 42,
+  "amp": false
+}
