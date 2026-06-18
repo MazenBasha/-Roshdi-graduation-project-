@@ -1,0 +1,63 @@
+{
+  "model_info": {
+    "name": "Wake Word Detector - Trial 2",
+    "trial": 2,
+    "architecture": "AttentionWakeWordCNN",
+    "wake_word": "رشدي",
+    "language": "Arabic",
+    "version": "2.0"
+  },
+  "improvements": [
+    "Channel and spatial attention mechanisms",
+    "Focal loss for better hard example handling",
+    "Cosine annealing with warm restarts",
+    "Label smoothing support",
+    "Improved residual blocks"
+  ],
+  "model_config": {
+    "total_parameters": 11357582,
+    "trainable_parameters": 11357582,
+    "input_shape": [
+      1,
+      1,
+      64,
+      32
+    ],
+    "output_classes": 2
+  },
+  "audio_config": {
+    "sample_rate": 16000,
+    "duration_seconds": 1.0,
+    "mel_bands": 64,
+    "n_fft": 1024,
+    "hop_length": 512,
+    "fmin": 20,
+    "fmax": 8000
+  },
+  "training_info": {
+    "loss_function": "Focal Loss (alpha-weighted, gamma=2.0)",
+    "optimizer": "AdamW",
+    "scheduler": "CosineAnnealingWarmRestarts",
+    "epochs_trained": 44,
+    "best_val_accuracy": 69.91150442477876
+  },
+  "test_performance": {
+    "test_accuracy": 73.68421052631578,
+    "positive_class_metrics": {
+      "precision": 0.6545454545454545,
+      "recall": 0.7659574468085106,
+      "f1_score": 0.7058823529411765
+    },
+    "negative_class_metrics": {
+      "precision": 0.8135593220338984,
+      "recall": 0.7164179104477612,
+      "f1_score": 0.7619047619047619
+    },
+    "confusion_matrix": {
+      "true_negatives": 48,
+      "false_positives": 19,
+      "false_negatives": 11,
+      "true_positives": 36
+    }
+  }
+}

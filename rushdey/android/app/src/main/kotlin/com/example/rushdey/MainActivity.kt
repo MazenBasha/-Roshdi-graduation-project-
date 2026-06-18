@@ -1,0 +1,788 @@
+package com.example.rushdey
+
+import android.Manifest
+import android.app.Activity
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.ImageFormat
+import android.graphics.Matrix
+import android.graphics.Rect
+import android.graphics.YuvImage
+import android.net.Uri
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.provider.MediaStore
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import android.util.Log
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.EventChannel
+import io.flutter.plugin.common.MethodChannel
+import kotlinx.coroutines.*
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.util.Locale
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageProxy
+import androidx.camera.lifecycle.ProcessCameraProvider
+
+class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
+    // Channel names
+    private val wakeWordMethodChannel = "com.example.rushdey/wakeword"
+    private val wakeWordEventChannel  = "com.example.rushdey/wakeword_events"
+    private val modelsMethodChannel   = "com.example.rushdey/models"
+    private val modelsEventChannel    = "com.example.rushdey/model_events"
+
+    // Event sinks
+    private var wakeWordEventSink: EventChannel.EventSink? = null
+    private var modelEventSink: EventChannel.EventSink? = null
+
+    // Pending results
+    private var pendingStartResult: MethodChannel.Result? = null
+    private var pendingCameraResult: MethodChannel.Result? = null
+    private var pendingCameraIntent: String = ""   // "face" or "currency"
+    private var pendingEnrollName: String = ""
+    private var enrollImageBytes: MutableList<ByteArray> = mutableListOf()
+    private var enrollPhotosNeeded = 3
+    private var enrollPhotosTaken = 0
+
+    // ML Engines
+    private lateinit var faceEngine: FaceEngine
+    private lateinit var currencyEngine: CurrencyEngine
+    private lateinit var ocrEngine: OCREngine
+    private var voskEngine: VoskIntentEngine? = null
+    private var faceReady = false
+    private var currencyReady = false
+    private var ocrReady = false
+
+    // TTS
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
+    private val ttsEnginePackage = "com.google.android.tts"
+    private var audioManager: AudioManager? = null
+    private var audioFocusRequest: AudioFocusRequest? = null
+
+    private var imageCapture: ImageCapture? = null
+    private var cameraLensFacing: Int = CameraSelector.LENS_FACING_BACK
+    private var cameraMirror: Boolean = false
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    // ─────────────────────── Flutter Engine Setup ─────────────────────────────
+
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+
+        // ── Wake Word channels (existing) ────────────────────────────────────
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, wakeWordMethodChannel)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "startListening" -> { val engine = call.argument<String>("engine") ?: "pytorch"; startListeningWithPermission(result, engine) }
+                    "stopListening"  -> { stopWakeWordService(); result.success(true) }
+                    "getStatus"      -> {
+                        val listening = WakeWordService.getInstance() != null
+                        result.success(mapOf(
+                            "isListening" to listening,
+                            "status"      to if (listening) "listening" else "stopped",
+                            "lastError"   to WakeWordService.getLastError()
+                        ))
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, wakeWordEventChannel)
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    wakeWordEventSink = events
+                    WakeWordService.setPendingEventSink(events)
+                    WakeWordService.getInstance()?.setEventSink(events)
+                }
+                override fun onCancel(arguments: Any?) {
+                    wakeWordEventSink = null
+                    WakeWordService.setPendingEventSink(null)
+                    WakeWordService.getInstance()?.setEventSink(null)
+                }
+            })
+
+        // ── Models channel (NEW) ─────────────────────────────────────────────
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, modelsMethodChannel)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "initModels"            -> handleInitModels(result)
+                    "startIntentListening"  -> handleStartIntentListening(result)
+                    "stopIntentListening"   -> handleStopIntentListening(result)
+                    "setCameraConfig"       -> handleSetCameraConfig(call.arguments, result)
+                    "getCameraConfig"       -> handleGetCameraConfig(result)
+                    "captureAndRecognizeFace"     -> handleCaptureFace(result)
+                    "captureAndDetectCurrency"    -> handleCaptureCurrency(result)
+                    "captureAndReadText"          -> handleCaptureOCR(result)
+                    "enrollPerson"          -> handleEnrollPerson(call.arguments, result)
+                    "deleteEnrolledPerson"  -> handleDeletePerson(call.arguments, result)
+                    "listEnrolledPersons"   -> handleListPersons(result)
+                    "speakText"             -> { speak(call.arguments as? String ?: ""); result.success(null) }
+                    else -> result.notImplemented()
+                }
+            }
+
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, modelsEventChannel)
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    modelEventSink = events
+                }
+                override fun onCancel(arguments: Any?) {
+                    modelEventSink = null
+                }
+            })
+
+        // Init TTS
+        audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
+        tts = TextToSpeech(this, this, ttsEnginePackage)
+
+        // Init ML engines early
+        initEngines()
+    }
+
+    private fun initCamera() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.addListener({
+            try {
+                val cameraProvider = cameraProviderFuture.get()
+                imageCapture = ImageCapture.Builder()
+                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                    .build()
+                val cameraSelector = CameraSelector.Builder()
+                    .requireLensFacing(cameraLensFacing)
+                    .build()
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(this, cameraSelector, imageCapture)
+            } catch (e: Exception) {
+                Log.e(TAG, "CameraX init failed", e)
+            }
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    // ─────────────────────── TTS ──────────────────────────────────────────────
+
+    override fun onInit(status: Int) {
+        if (status == TextToSpeech.SUCCESS) {
+            val locale = Locale("ar", "EG")
+            
+            // Prefer stable offline voice for Egyptian Arabic
+            val voices = tts?.voices
+            val bestVoice = voices?.find {
+                it.locale.language == "ar" &&
+                (it.locale.country == "EG" || it.name.contains("eg", ignoreCase = true)) &&
+                !it.isNetworkConnectionRequired
+            } ?: voices?.find {
+                it.locale.language == "ar" && !it.isNetworkConnectionRequired
+            } ?: voices?.find { it.locale.language == "ar" }
+
+            if (bestVoice != null) {
+                tts?.voice = bestVoice
+                Log.i(TAG, "Selected offline voice: ${bestVoice.name}")
+            } else {
+                tts?.setLanguage(locale)
+            }
+            
+            ttsReady = true
+            tts?.setPitch(1.0f)
+            tts?.setSpeechRate(0.98f)
+            tts?.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) {}
+                override fun onDone(utteranceId: String?) { abandonAudioFocus() }
+                override fun onError(utteranceId: String?) { abandonAudioFocus() }
+            })
+            
+            Log.i(TAG, "TTS init: ready=$ttsReady")
+        }
+    }
+
+    private var lastSpokenText: String? = null
+    private var lastSpokenTime: Long = 0
+
+    private fun speak(text: String) {
+        if (!ttsReady || text.isBlank()) return
+        if (!requestAudioFocus()) {
+            Log.w(TAG, "Audio focus not granted; skipping TTS")
+            return
+        }
+        
+        val currentTime = System.currentTimeMillis()
+        // Debounce: Avoid repeating the exact same text within 3 seconds
+        if (text == lastSpokenText && (currentTime - lastSpokenTime) < 3000) {
+            return
+        }
+
+        lastSpokenText = text
+        lastSpokenTime = currentTime
+        
+        Log.d(TAG, "Speaking: $text")
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "rushdie_tts")
+    }
+
+    private fun requestAudioFocus(): Boolean {
+        val manager = audioManager ?: return true
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val attributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                .setAudioAttributes(attributes)
+                .setOnAudioFocusChangeListener { }
+                .build()
+            audioFocusRequest = request
+            manager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        } else {
+            @Suppress("DEPRECATION")
+            manager.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK) ==
+                AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        }
+    }
+
+    private fun abandonAudioFocus() {
+        val manager = audioManager ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            audioFocusRequest?.let { manager.abandonAudioFocusRequest(it) }
+        } else {
+            @Suppress("DEPRECATION")
+            manager.abandonAudioFocus(null)
+        }
+    }
+
+    // ─────────────────────── Engine Init ─────────────────────────────────────
+
+    private fun initEngines() {
+        CoroutineScope(Dispatchers.IO).launch {
+            faceEngine = FaceEngine(this@MainActivity)
+            faceReady = faceEngine.initialize()
+            Log.i(TAG, "FaceEngine ready: $faceReady")
+
+            currencyEngine = CurrencyEngine(this@MainActivity)
+            currencyReady = currencyEngine.initialize()
+            Log.i(TAG, "CurrencyEngine ready: $currencyReady")
+            
+            ocrEngine = OCREngine()
+            ocrReady = true // No heavy init for ML Kit
+            Log.i(TAG, "OCREngine ready: $ocrReady")
+
+            withContext(Dispatchers.Main) {
+                sendModelEvent(mapOf(
+                    "type" to "engines_ready",
+                    "face" to faceReady,
+                    "currency" to currencyReady,
+                    "ocr" to ocrReady
+                ))
+            }
+        }
+    }
+
+    private fun handleInitModels(result: MethodChannel.Result) {
+        // Init Vosk engine (async — may download model)
+        if (voskEngine == null) {
+            voskEngine = VoskIntentEngine(this) { modelEventSink }
+            voskEngine?.initialize { ready ->
+                sendModelEvent(mapOf("type" to "vosk_ready", "ready" to ready))
+            }
+        }
+        result.success(mapOf("face" to faceReady, "currency" to false))
+    }
+
+    // ─────────────────────── Intent Listening ────────────────────────────────
+
+    private fun handleStartIntentListening(result: MethodChannel.Result) {
+        if (voskEngine == null) {
+            voskEngine = VoskIntentEngine(this) { modelEventSink }
+            voskEngine?.initialize { ready ->
+                if (ready) voskEngine?.startListening()
+                sendModelEvent(mapOf("type" to "vosk_ready", "ready" to ready))
+            }
+        } else {
+            voskEngine?.startListening()
+        }
+        result.success(true)
+    }
+
+    private fun handleStopIntentListening(result: MethodChannel.Result) {
+        voskEngine?.stopListening()
+        result.success(true)
+    }
+
+    private fun handleSetCameraConfig(args: Any?, result: MethodChannel.Result) {
+        val map = args as? Map<*, *>
+        val lens = (map?.get("lensFacing") as? String)?.lowercase()
+        val mirror = map?.get("mirror") as? Boolean
+
+        cameraLensFacing = if (lens == "front") {
+            CameraSelector.LENS_FACING_FRONT
+        } else {
+            CameraSelector.LENS_FACING_BACK
+        }
+        if (mirror != null) cameraMirror = mirror
+
+        if (hasCameraPermission()) {
+            initCamera()
+        }
+
+        result.success(mapOf(
+            "lensFacing" to if (cameraLensFacing == CameraSelector.LENS_FACING_FRONT) "front" else "back",
+            "mirror" to cameraMirror
+        ))
+    }
+
+    private fun handleGetCameraConfig(result: MethodChannel.Result) {
+        result.success(mapOf(
+            "lensFacing" to if (cameraLensFacing == CameraSelector.LENS_FACING_FRONT) "front" else "back",
+            "mirror" to cameraMirror
+        ))
+    }
+
+    // ─────────────────────── Camera + Inference ───────────────────────────────
+
+    private fun handleCaptureFace(result: MethodChannel.Result) {
+        if (!hasCameraPermission()) {
+            requestCameraPermission(result, "face")
+            return
+        }
+        pendingCameraResult = result
+        pendingCameraIntent = "face"
+        launchCamera()
+    }
+
+    private fun handleCaptureCurrency(result: MethodChannel.Result) {
+        if (!hasCameraPermission()) {
+            requestCameraPermission(result, "currency")
+            return
+        }
+        pendingCameraResult = result
+        pendingCameraIntent = "currency"
+        launchCamera()
+    }
+
+    private fun launchCamera() {
+        if (imageCapture == null) {
+            initCamera()
+            mainHandler.postDelayed({ launchCamera() }, 500)
+            return
+        }
+
+        imageCapture?.takePicture(ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageCapturedCallback() {
+            override fun onCaptureSuccess(image: ImageProxy) {
+                val bytes = imageProxyToJpegBytes(image, cameraMirror)
+                    ?: run {
+                        val buffer = image.planes[0].buffer
+                        val fallback = ByteArray(buffer.capacity())
+                        buffer.get(fallback)
+                        fallback
+                    }
+                image.close()
+
+                sendModelEvent(mapOf(
+                    "type" to "camera_preview",
+                    "imageBytes" to bytes
+                ))
+                shutdownCamera()
+                
+                when {
+                    pendingCameraIntent == "face"     -> runFaceInference(bytes)
+                    pendingCameraIntent == "currency" -> runCurrencyInference(bytes)
+                    pendingCameraIntent == "ocr"      -> runOCRInference(bytes)
+                    pendingCameraIntent == "enroll"   -> runEnrollCapture(bytes)
+                }
+            }
+
+            override fun onError(exception: ImageCaptureException) {
+                Log.e(TAG, "Photo capture failed: ${exception.message}", exception)
+                shutdownCamera()
+                val result = pendingCameraResult
+                pendingCameraResult = null
+                result?.error("CAMERA_ERROR", exception.message, null)
+            }
+        })
+    }
+
+    private fun shutdownCamera() {
+        try {
+            val cameraProvider = ProcessCameraProvider.getInstance(this).get()
+            cameraProvider.unbindAll()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to shutdown camera", e)
+        } finally {
+            imageCapture = null
+        }
+    }
+
+    private fun imageProxyToJpegBytes(image: ImageProxy, mirror: Boolean): ByteArray? {
+        val bitmap = imageProxyToBitmap(image) ?: return null
+        val finalBitmap = if (mirror) mirrorBitmap(bitmap) else bitmap
+        return try {
+            val out = ByteArrayOutputStream()
+            finalBitmap.compress(Bitmap.CompressFormat.JPEG, 90, out)
+            out.toByteArray()
+        } finally {
+            if (finalBitmap !== bitmap) finalBitmap.recycle()
+        }
+    }
+
+    private fun imageProxyToBitmap(image: ImageProxy): Bitmap? {
+        if (image.planes.size < 3) {
+            val buffer = image.planes[0].buffer
+            val bytes = ByteArray(buffer.remaining())
+            buffer.get(bytes)
+            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+            val rotated = rotateBitmapIfNeeded(bmp, image.imageInfo.rotationDegrees)
+            if (rotated !== bmp) bmp.recycle()
+            return rotated
+        }
+
+        val yBuffer = image.planes[0].buffer
+        val uBuffer = image.planes[1].buffer
+        val vBuffer = image.planes[2].buffer
+
+        val ySize = yBuffer.remaining()
+        val uSize = uBuffer.remaining()
+        val vSize = vBuffer.remaining()
+
+        val nv21 = ByteArray(ySize + uSize + vSize)
+        yBuffer.get(nv21, 0, ySize)
+        vBuffer.get(nv21, ySize, vSize)
+        uBuffer.get(nv21, ySize + vSize, uSize)
+
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
+        val out = ByteArrayOutputStream()
+        if (!yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 90, out)) {
+            return null
+        }
+        val jpegBytes = out.toByteArray()
+        val bmp = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size) ?: return null
+        val rotated = rotateBitmapIfNeeded(bmp, image.imageInfo.rotationDegrees)
+        if (rotated !== bmp) bmp.recycle()
+        return rotated
+    }
+
+    private fun mirrorBitmap(bitmap: Bitmap): Bitmap {
+        val matrix = Matrix().apply { preScale(-1f, 1f) }
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    }
+
+    private fun rotateBitmapIfNeeded(bitmap: Bitmap, degrees: Int): Bitmap {
+        if (degrees == 0) return bitmap
+        val matrix = Matrix().apply { postRotate(degrees.toFloat()) }
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    }
+    private fun runCurrencyInference(imageBytes: ByteArray) {
+        val result = pendingCameraResult
+        pendingCameraResult = null
+
+        CoroutineScope(Dispatchers.IO).launch {
+            val currResult = if (currencyReady) {
+                currencyEngine.detect(imageBytes)
+            } else {
+                CurrencyEngine.CurrencyResult(emptyList(), 0, "\u0645\u062d\u0631\u0643 \u0627\u0644\u0639\u0645\u0644\u0629 \u063a\u064a\u0631 \u062c\u0627\u0647\u0632")
+            }
+
+            withContext(Dispatchers.Main) {
+                speak(currResult.arabicName)
+                sendModelEvent(mapOf(
+                    "type"       to "currency_result",
+                    "arabicName" to currResult.arabicName,
+                    "total"      to currResult.total,
+                    "ttsText"    to currResult.arabicName,
+                    "imageBytes" to imageBytes
+                ))
+                result?.success(mapOf(
+                    "arabicName" to currResult.arabicName,
+                    "total"      to currResult.total,
+                    "ttsText"    to currResult.arabicName
+                ))
+            }
+        }
+    }
+
+    private fun runOCRInference(imageBytes: ByteArray) {
+        val result = pendingCameraResult
+        pendingCameraResult = null
+
+        CoroutineScope(Dispatchers.IO).launch {
+            val text = if (ocrReady) {
+                ocrEngine.recognizeText(imageBytes)
+            } else "محرك القراءة غير جاهز"
+
+            withContext(Dispatchers.Main) {
+                speak(text)
+                sendModelEvent(mapOf(
+                    "type"    to "ocr_result",
+                    "text"    to text,
+                    "ttsText" to text,
+                    "imageBytes" to imageBytes
+                ))
+                result?.success(mapOf("text" to text))
+            }
+        }
+    }
+
+    private fun handleCaptureOCR(result: MethodChannel.Result) {
+        if (!hasCameraPermission()) {
+            requestCameraPermission(result, "ocr")
+            return
+        }
+        pendingCameraResult = result
+        pendingCameraIntent = "ocr"
+        launchCamera()
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        // Kept for other intents if needed
+    }
+
+    private fun runFaceInference(imageBytes: ByteArray) {
+        val result = pendingCameraResult
+        pendingCameraResult = null
+
+        CoroutineScope(Dispatchers.IO).launch {
+            val faceResult = if (faceReady) {
+                faceEngine.recognize(imageBytes)
+            } else null
+
+            withContext(Dispatchers.Main) {
+                if (faceResult == null) {
+                    val msg = "نموذج التعرف على الوجوه غير جاهز"
+                    speak(msg)
+                    result?.success(mapOf("error" to msg))
+                    return@withContext
+                }
+
+                val ttsText = when {
+                    faceResult.name == FaceEngine.NO_FACE_LABEL -> "تعذر الكشف عن أشخاص"
+                    faceResult.recognized -> "ده ${faceResult.name}"
+                    faceResult.name == "لا يوجد أشخاص مسجلين" -> "لا يوجد أشخاص مسجلين"
+                    else -> "شخص غير مسجل"
+                }
+                speak(ttsText)
+
+                val displayName = if (faceResult.name == FaceEngine.NO_FACE_LABEL) "غير محدد" else faceResult.name
+
+                sendModelEvent(mapOf(
+                    "type"       to "face_result",
+                    "name"       to displayName,
+                    "similarity" to faceResult.similarity,
+                    "recognized" to faceResult.recognized,
+                    "ttsText"    to ttsText,
+                    "imageBytes" to imageBytes
+                ))
+                result?.success(mapOf(
+                    "name"       to displayName,
+                    "similarity" to faceResult.similarity,
+                    "recognized" to faceResult.recognized,
+                    "ttsText"    to ttsText
+                ))
+            }
+        }
+    }
+
+
+    private fun sendCurrencyCapture(imageBytes: ByteArray) {
+        val result = pendingCameraResult
+        pendingCameraResult = null
+        sendModelEvent(mapOf(
+            "type" to "currency_image",
+            "imageBytes" to imageBytes
+        ))
+        result?.success(true)
+    }
+
+    // ─────────────────────── Enrollment ──────────────────────────────────────
+
+    private fun handleEnrollPerson(args: Any?, result: MethodChannel.Result) {
+        val map = args as? Map<*, *>
+        val name = map?.get("name") as? String
+        if (name.isNullOrBlank()) {
+            result.error("INVALID_ARGS", "Name is required", null)
+            return
+        }
+        if (!hasCameraPermission()) {
+            requestCameraPermission(result, "enroll:$name")
+            return
+        }
+        pendingEnrollName = name
+        enrollImageBytes.clear()
+        enrollPhotosTaken = 0
+        pendingCameraResult = result
+        pendingCameraIntent = "enroll"
+        sendModelEvent(mapOf("type" to "enroll_start", "name" to name, "photosNeeded" to enrollPhotosNeeded))
+        launchCamera()
+    }
+
+    private fun runEnrollCapture(imageBytes: ByteArray) {
+        enrollImageBytes.add(imageBytes)
+        enrollPhotosTaken++
+        sendModelEvent(mapOf(
+            "type"   to "enroll_progress",
+            "taken"  to enrollPhotosTaken,
+            "needed" to enrollPhotosNeeded
+        ))
+
+        if (enrollPhotosTaken < enrollPhotosNeeded) {
+            // Take another photo
+            launchCamera()
+        } else {
+            // Enroll with all collected images
+            val result = pendingCameraResult
+            pendingCameraResult = null
+            val name = pendingEnrollName
+            val images = enrollImageBytes.toList()
+            enrollImageBytes.clear()
+
+            CoroutineScope(Dispatchers.IO).launch {
+                val ok = faceEngine.enrollPerson(name, images)
+                withContext(Dispatchers.Main) {
+                    if (ok) {
+                        speak("تم تسجيل $name بنجاح")
+                        sendModelEvent(mapOf("type" to "enroll_done", "name" to name, "success" to true))
+                        result?.success(mapOf("success" to true, "name" to name))
+                    } else {
+                        speak("فشل تسجيل $name")
+                        sendModelEvent(mapOf("type" to "enroll_done", "name" to name, "success" to false))
+                        result?.error("ENROLL_FAILED", "Could not extract embeddings", null)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun handleDeletePerson(args: Any?, result: MethodChannel.Result) {
+        val name = args as? String
+        if (name.isNullOrBlank()) { result.error("INVALID_ARGS", "Name required", null); return }
+        val ok = faceEngine.deleteEnrolledPerson(name)
+        result.success(ok)
+    }
+
+    private fun handleListPersons(result: MethodChannel.Result) {
+        val persons = if (faceReady) faceEngine.listEnrolledPersons() else emptyList()
+        result.success(persons)
+    }
+
+    // ─────────────────────── Permissions ─────────────────────────────────────
+
+    private fun hasMicrophonePermission() =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+
+    private fun hasCameraPermission() =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+
+    private var currentEngine: String = "pytorch"
+    private fun startListeningWithPermission(result: MethodChannel.Result, engine: String) {
+        this.currentEngine = engine
+        if (hasMicrophonePermission()) { startWakeWordService(currentEngine); result.success(true); return }
+        if (pendingStartResult != null) {
+            result.error("MIC_PERMISSION_PENDING", "Already requesting permission", null); return
+        }
+        pendingStartResult = result
+        ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO)
+    }
+
+    private fun requestCameraPermission(result: MethodChannel.Result, intent: String) {
+        pendingCameraResult = result
+        pendingCameraIntent = intent
+        ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), REQUEST_CAMERA_PERMISSION)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+
+        when (requestCode) {
+            REQUEST_RECORD_AUDIO -> {
+                val result = pendingStartResult; pendingStartResult = null
+                if (granted) { startWakeWordService(currentEngine); result?.success(true) }
+                else result?.error("MIC_PERMISSION_DENIED", "Microphone permission denied", null)
+            }
+            REQUEST_CAMERA_PERMISSION -> {
+                if (granted) {
+                    initCamera()
+                    when {
+                        pendingCameraIntent == "face"     -> launchCamera()
+                        pendingCameraIntent == "currency" -> {
+                            pendingCameraIntent = "currency_flutter"
+                            launchCamera()
+                        }
+                        pendingCameraIntent == "currency_flutter" -> launchCamera()
+                        pendingCameraIntent.startsWith("enroll:") -> {
+                            pendingEnrollName = pendingCameraIntent.substringAfter("enroll:")
+                            pendingCameraIntent = "enroll"
+                            launchCamera()
+                        }
+                    }
+                } else {
+                    val result = pendingCameraResult; pendingCameraResult = null
+                    result?.error("CAMERA_PERMISSION_DENIED", "Camera permission denied", null)
+                }
+            }
+        }
+    }
+
+    // ─────────────────────── Wake Word Service ────────────────────────────────
+
+    private fun startWakeWordService(engine: String = currentEngine) {
+        WakeWordService.setPendingEventSink(wakeWordEventSink)
+        val intent = Intent(this, WakeWordService::class.java).apply {
+            action = WakeWordService.ACTION_START_LISTENING
+            putExtra(WakeWordService.EXTRA_ENGINE_TYPE, engine)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+        WakeWordService.getInstance()?.setEventSink(wakeWordEventSink)
+    }
+
+    private fun stopWakeWordService() {
+        val intent = Intent(this, WakeWordService::class.java).apply {
+            action = WakeWordService.ACTION_STOP_LISTENING
+        }
+        startService(intent)
+    }
+
+    // ─────────────────────── Helpers ─────────────────────────────────────────
+
+    private fun sendModelEvent(event: Map<String, Any>) {
+        mainHandler.post { modelEventSink?.success(event) }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        tts?.shutdown()
+        if (::faceEngine.isInitialized) faceEngine.release()
+        voskEngine?.release()
+    }
+
+    companion object {
+        private const val TAG = "MainActivity"
+        private const val REQUEST_RECORD_AUDIO      = 1101
+        private const val REQUEST_CAMERA            = 1102
+        private const val REQUEST_CAMERA_PERMISSION = 1103
+    }
+}
