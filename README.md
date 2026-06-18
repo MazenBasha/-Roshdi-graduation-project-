@@ -1,50 +1,62 @@
+# Beyond The Limits — Roshdi Assistive AI System
 
-# Beyond The Limits — Assistive AI System
+A multi-modal AI system designed to assist visually impaired users by providing real-time perception through **voice commands**, **face recognition**, and **Egyptian currency detection** — all delivered through a single cross-platform **Flutter** mobile app (*Roshdi / رشدي*).
 
-A multi-modal AI system designed to assist visually impaired users by providing real-time perception through **voice commands**, **face recognition**, and **Egyptian currency detection**.
-
-The system integrates three independent deep-learning modules:
+The system integrates three independent deep-learning modules plus the mobile application that runs them on-device:
 
 1. **Voice Commands (Wake Word Detection)** – Activates the system via the Arabic wake word *"رشدي"*
-2. **Face Recognition** – Identifies registered individuals using lightweight facial embeddings
+2. **Face Recognition** – Identifies registered individuals using a from-scratch PyTorch ArcFace model
 3. **Egyptian Currency Detection** – Recognizes Egyptian banknotes using a mobile-optimized CNN
+4. **Roshdi Mobile App** – A Flutter app that bundles all three models and runs them offline on the phone
 
-Each module is implemented as an independent subsystem that can run locally or be integrated into a mobile application.
+Each ML module is an independent subsystem that can be trained and evaluated on its own, then exported and embedded into the mobile app.
 
 ---
 
 ## Repository Structure
 
 ```
-BeyondTheLimits/
+Roshdi graduation project/
 │
-├── Face_recognition/
-│   ├── scripts/
-│   ├── models/
-│   ├── best_model.h5
-│   ├── backbone.h5
-│   ├── README.md
-│   └── ...
+├── Face Recognition/             # PyTorch face recognition pipeline (iResNet-18 + ArcFace)
+│   ├── train.py                  # 2-stage CE → ArcFace training
+│   ├── evaluate.py / evaluate_full.py
+│   ├── inference.py              # embedding + gallery search
+│   ├── realtime.py               # live multi-face recognition + tracking
+│   ├── model.py                  # iResNet backbones + ArcFace head
+│   ├── quantize.py               # INT8 dynamic quant + ONNX export
+│   ├── docs/  reports/  scripts/  tests/
+│   ├── requirements.txt
+│   └── README.md
 │
-├── Currency_detection/
+├── Egyptian Currency Detection/  # PyTorch CurrencyMobileNet classifier
 │   ├── train.py
 │   ├── evaluate.py
-│   ├── model.py
-│   ├── export_ptl.py
-│   ├── README.md
-│   └── ...
+│   ├── model.py                  # CurrencyMobileNet (MobileNetV2-style)
+│   ├── infer.py / camera.py
+│   ├── export_ptl.py             # TorchScript Lite (.ptl) export
+│   ├── config.py / dataset.py / utils.py
+│   ├── generate_report.py / Progress_Report.pdf
+│   ├── outputs/
+│   ├── requirements.txt
+│   └── README.md
 │
-├── wake_word/
-│   ├── CLEANING/
-│   │   └── Voice commands/
-│   │       ├── app.py
-│   │       ├── templates/
-│   │       ├── wake_word_final.ipynb
-│   │       ├── README.md
-│   │       └── ...
-│   └── ...
+├── Voice commands/               # Wake word detection ("رشدي")
+│   ├── app.py                    # Flask dataset-cleaning / annotation server
+│   ├── wake_word_final.ipynb     # Mel-spectrogram CNN training notebook
+│   ├── templates/                # Web UI
+│   ├── screenshots/
+│   └── README.md
 │
-└── README.md (this file)
+├── rushdey/                      # Flutter mobile app (Android / iOS / web / desktop)
+│   ├── lib/main.dart
+│   ├── assets/models/            # bundled exported models (.ptl / .tflite)
+│   ├── android/  ios/  web/  windows/  macos/  linux/
+│   ├── pubspec.yaml
+│   └── test/
+│
+├── .gitignore
+└── README.md                     # this file
 ```
 
 ---
@@ -68,122 +80,75 @@ Voice Command Processing
              └──→ Detect banknote value
 ```
 
-The wake word activates the assistant, after which the system executes the requested model.
+The wake word activates the assistant, after which the requested model runs on-device and results are returned as audio feedback.
 
 ---
 
 ## 1. Face Recognition Module
 
+**Location:** `Face Recognition/`
+
 ### Purpose
 
-This subsystem performs **deep face recognition** for identifying registered individuals.
-
-Supported operations:
+A **PyTorch** face recognition pipeline for the Roshdi assistive glasses. It performs:
 - **1:1 Verification** (Is this person X?)
 - **1:N Identification** (Who is this person?)
 
 ### Architecture
 
-The model uses **MobileFaceNet**, a lightweight neural network optimized for mobile devices.
+Built around an **iResNet-18** backbone trained **from scratch** on CASIA-WebFace using a 2-stage **CrossEntropy → ArcFace** strategy, then wrapped with multi-face tracking + smoothing for real-world robustness. A pretrained FaceNet/VGGFace2 model is bundled as a **baseline for comparison only** — the system runs on the from-scratch model by default.
 
 | Attribute | Value |
 |-----------|-------|
-| Backbone | MobileFaceNet |
+| Framework | PyTorch 2 |
+| Backbone | iResNet-{18, 34, 50, 100} (default 18) |
 | Training Head | ArcFace (Additive Angular Margin) |
-| Input Size | 112×112 RGB |
-| Embedding Size | 128-D normalized |
-| Total Parameters | 196,800 |
-| Model Size | ~930 KB |
+| Training Strategy | 2-stage: CE warm-up → ArcFace |
+| Input Size | 112×112 RGB (MTCNN + 5-pt alignment) |
+| Embedding Size | 512-D normalized |
+| Backbone Params | 24.0M (iResNet-18) |
 
-**ArcFace Parameters:**
-- Margin: **0.5 rad**
-- Scale: **64**
+### Headline Results
 
-### Training Pipeline
+| Metric | From-scratch iResNet-18 (v4) | Pretrained FaceNet baseline |
+|---|---:|---:|
+| LFW mean accuracy (10-fold) | **79.65% ± 1.23%** | 99.25% ± 0.42% |
+| LFW ROC AUC | 0.881 | 0.9995 |
+| TP rate @ thr=0.45 (5 enrollments) | **100%** | 100% |
+| FP rate @ thr=0.45 | **8%** | — |
+| FP rate @ thr=0.50 | **2%** | — |
+| Embedding latency (MPS, batch 64) | 28 ms / face | 28 ms / face |
+| Real-time loop latency (480p, 1 face) | ~25 ms / frame | ~30 ms |
 
-Training uses **TensorFlow / Keras** with `tf.data` pipeline.
+The 79.65% LFW figure reflects a constrained training budget (1,000 of CASIA's 10,572 identities, ~10 effective epochs on Apple Silicon). The model is nonetheless production-ready at sensible thresholds (100% TP / 8% FP @ 0.45).
 
-**Data Augmentations:**
-- Random brightness
-- Random contrast
-- Horizontal flip
+### Key Features
 
-**Training Configuration:**
+- **CLAHE on LAB-L channel** for lighting robustness
+- **IoU + EMA multi-face tracker** with name voting and sticky labels
+- Optional **horizontal-flip TTA** at inference
+- **Novelty-gated rolling-window** online enrollment
+- 10-fold verification eval with TAR@FAR + ROC AUC
+- Edge export: **INT8 dynamic quantization + ONNX** (FP32/FP16)
 
-| Parameter | Value |
-|----------|-------|
-| Epochs | 30 |
-| Batch Size | 32 |
-| Optimizer | Adam |
-| Learning Rate | 0.001 |
-| Early Stopping | patience = 10 |
+### Usage
 
-### Dataset
-
-Two datasets were combined:
-
-| Dataset | Details |
-|---------|---------|
-| LFW Funneled | ~13.2k images, 5,749 identities |
-| DigiFace-1M Subset | 2,000 identities |
-
-**Split:**
-- 1,600 identities for training
-- 400 identities for validation
-
-### Training Results
-
-| Metric | Value |
-|--------|-------|
-| Final Training Accuracy | **91.85%** |
-| Final Validation Accuracy | **47.21%** |
-| Best Validation Loss | 4.1301 |
-| Best Epoch | 25 |
-
-*Note: The validation accuracy reflects the large-class classification problem (5,749 identities to classify).*
-
-### Inference Pipeline
-
-```
-Face Image
-    │
-    ▼
-Preprocessing (112×112)
-    │
-    ▼
-MobileFaceNet Backbone
-    │
-    ▼
-128-D Face Embedding
-    │
-    ├──→ Cosine Similarity (1:1 verification)
-    └──→ Gallery Search (1:N identification)
+```bash
+cd "Face Recognition"
+pip install -r requirements.txt
+python train.py            # train iResNet-18 (CE → ArcFace)
+python evaluate.py         # / evaluate_full.py for full LFW protocol
+python realtime.py         # live multi-face recognition
+python quantize.py         # INT8 + ONNX export for the mobile app
 ```
 
-### Delivered Artifacts
-
-**Models:**
-- `best_model.h5` - Full model with ArcFace head
-- `training_model.h5` - Training checkpoint
-- `backbone.h5` - Inference backbone only
-- `training_history.json` - Training metrics
-- `training.log` - Detailed training logs
-
-**Scripts:**
-- `evaluate.py` - Model evaluation
-- `evaluate_verification.py` - 1:1 verification tests
-- `evaluate_identification.py` - 1:N identification tests
-- `recognize_person.py` - Real-time recognition
-- `enroll_person.py` - Enroll new person
-- `camera_test.py` - Live camera testing
-- `export_tflite.py` - Mobile deployment export
-
-**Mobile Export:**
-- TensorFlow Lite (float16) format for iOS/Android deployment
+For full details, see [Face Recognition/README.md](Face%20Recognition/README.md).
 
 ---
 
 ## 2. Egyptian Currency Detection Module
+
+**Location:** `Egyptian Currency Detection/`
 
 ### Purpose
 
@@ -191,391 +156,139 @@ Recognizes Egyptian banknotes using a lightweight CNN designed for mobile device
 
 ### Supported Classes
 
-| Index | Banknote |
-|-------|----------|
-| 0 | 1 EGP |
-| 1 | 5 EGP |
-| 2 | 10 EGP (old design) |
-| 3 | 10 EGP (new design) |
-| 4 | 20 EGP (old design) |
-| 5 | 20 EGP (new design) |
-| 6 | 50 EGP |
-| 7 | 100 EGP |
-| 8 | 200 EGP |
+| Index | Banknote | Index | Banknote |
+|-------|----------|-------|----------|
+| 0 | 1 EGP | 5 | 20 EGP (new) |
+| 1 | 5 EGP | 6 | 50 EGP |
+| 2 | 10 EGP (old) | 7 | 100 EGP |
+| 3 | 10 EGP (new) | 8 | 200 EGP |
+| 4 | 20 EGP (old) | | |
 
 ### Model Architecture
 
 Custom **CurrencyMobileNet** inspired by MobileNetV2.
 
-**Key Components:**
-- Depthwise separable convolutions
-- Inverted residual blocks
-- ReLU6 activations
-- Global average pooling
-
-**Model Statistics:**
-
 | Attribute | Value |
 |-----------|-------|
+| Framework | PyTorch |
 | Total Parameters | ~2.2M |
 | FP32 Model Size | ~8.5 MB |
 | TorchScript Lite Size | ~8 MB |
-| Inference Speed | Real-time on mobile |
 
-**Advantages:**
-- Fast inference on edge devices
-- Mobile-optimized architecture
-- Quantization ready
-- Low memory footprint
+**Key components:** depthwise separable convolutions, inverted residual blocks, ReLU6 activations, global average pooling.
 
-### Training Features
+**Training features:** Kaiming init, label smoothing (α=0.1), weighted sampling for class imbalance, cosine annealing LR, mixed precision (AMP), gradient clipping.
 
-**Initialization & Regularization:**
-- Kaiming initialization
-- Label smoothing (α=0.1)
-- Weighted sampling for class imbalance
-- Cosine annealing learning rate decay
-- Mixed precision training (AMP)
-- Gradient clipping
+**Augmentations** (for real-world variation — folded/worn notes, occlusion, lighting): random crop, rotation (±15°), perspective distortion, Gaussian blur, random erasing, color jitter.
 
-**Data Augmentations:**
-- Random crop (80-100% scale)
-- Rotation (±15°)
-- Perspective distortion
-- Gaussian blur
-- Random erasing
-- Color jitter (brightness, contrast, saturation)
+### Usage
 
-These augmentations handle real-world variations:
-- Folded/bent notes
-- Partial occlusion
-- Variable lighting conditions
-- Worn/damaged currency
-
-### Evaluation Metrics
-
-Comprehensive evaluation includes:
-- Accuracy
-- Per-class Precision, Recall, F1-Score
-- Mean Average Precision (mAP)
-- Confusion Matrix
-- Class-specific analysis
-
-### Training & Evaluation
-
-**Train Model:**
 ```bash
-python train.py
+cd "Egyptian Currency Detection"
+pip install -r requirements.txt
+python train.py                                  # train
+python train.py --epochs 50 --batch-size 64 --lr 0.005   # custom
+python evaluate.py                               # evaluate on test set
+python infer.py        # single-image inference   (camera.py for live)
+python export_ptl.py                             # export model.ptl (TorchScript Lite)
 ```
 
-**Custom Training:**
-```bash
-python train.py --epochs 50 --batch-size 64 --lr 0.005
-```
-
-**Evaluate on Test Set:**
-```bash
-python evaluate.py
-```
-
-**Export Mobile Model:**
-```bash
-python export_ptl.py
-```
-
-This creates `model.ptl` (TorchScript Lite format).
-
-### Mobile Deployment
-
-The model is exported as **TorchScript Lite (.ptl)**.
-
-**Example Android Integration:**
-```kotlin
-val module = LiteModuleLoader.load(assetFilePath(this, "model.ptl"))
-val inputTensor = TensorImageFactory.imageYUV420CpuImageToFloatDeviceImage(image)
-val output = module.forward(inputTensor)
-val confidences = output.confidences
-```
+For full details, see [Egyptian Currency Detection/README.md](Egyptian%20Currency%20Detection/README.md).
 
 ---
 
 ## 3. Voice Commands — Wake Word Detection
 
+**Location:** `Voice commands/`
+
 ### Purpose
 
-Detects the Arabic wake word **"رشدي"** to activate the assistant.
+Detects the Arabic wake word **"رشدي"** to activate the assistant. The module includes a web-based dataset-cleaning tool, a training pipeline, and an evaluation system.
 
-The module includes:
-- **Dataset Cleaning Tool** – Web-based collaborative annotation
-- **Training Pipeline** – Mel-spectrogram CNN training
-- **Evaluation System** – Comprehensive metrics and visualization
+### Dataset Cleaning Tool (`app.py`)
 
-For detailed information, see [Voice Commands README](wake_word/CLEANING/Voice%20commands/README.md).
+A Flask web application for collaborative labeling of wake-word audio samples:
+- Multi-user labeling with persistent user IDs and file-assignment locking
+- Automatic stale-assignment recovery (30-minute timeout)
+- Real-time sample-count tracking, thread-safe concurrent access
+- Keyboard shortcuts: `1` → Positive (wake word), `2` → Negative
 
-### Dataset Cleaning Tool
+### Training Pipeline (`wake_word_final.ipynb`)
 
-A Flask web application for collaborative labeling of wake word audio samples.
+Mel-spectrogram features → augmentation (pitch shift, time stretch, noise) → ResNet-style CNN with early stopping → evaluation + visualization → exported checkpoint.
 
-**Features:**
-- Multi-user labeling with persistent user IDs
-- File assignment locking (prevents duplicate labeling)
-- Automatic stale assignment recovery (30-minute timeout)
-- Real-time sample count tracking
-- Keyboard shortcuts for fast labeling
-- Thread-safe concurrent access
-
-**Keyboard Shortcuts:**
-- `1` → Mark as Positive (wake word detected)
-- `2` → Mark as Negative (no wake word)
-
-**Runtime Directory Structure:**
-```
-cleaned_dataset/
-├── positive/          # Wake word samples
-├── negative/          # Non-wake word samples
-└── in_progress/       # Temporary assignment directory
-```
-
-Files are automatically moved after labeling with unique filenames to prevent collisions.
-
-### Training Pipeline
-
-Implemented in `wake_word_final.ipynb`.
-
-**Pipeline Stages:**
-1. Load and explore cleaned dataset
-2. Extract Mel-spectrogram features from audio
-3. Apply data augmentation (pitch shift, time stretch, noise injection)
-4. Split into train/validation/test sets
-5. Train ResNet-style CNN with early stopping
-6. Evaluate on held-out test set
-7. Generate performance visualizations
-8. Export best model checkpoint
-
-### Audio Configuration
-
-| Parameter | Value |
-|-----------|-------|
-| Sample Rate | 16 kHz |
-| Duration | 1 second |
-| Mel-spectrogram Bands | 64 |
-| Input Shape | (64, 32) 2D features |
-| Normalization | Log-scaled, min-max normalized |
-
-### Model Architecture
-
-**Deep Residual CNN (ResNet-inspired)**
-
-**Layer Structure:**
-
-1. **Initial Convolution Block** → 32 filters
-   - 3×3 kernel, MaxPool 2×2
-   
-2. **Residual Block 1** → 64 filters (stride=2)
-   - Dual 3×3 convolutions with BatchNorm
-   - Skip connection for improved gradients
-   
-3. **Residual Block 2** → 128 filters (stride=2)
-   - Deeper feature extraction
-   
-4. **Residual Block 3** → 256 filters (stride=2)
-   - High-level feature representation
-   
-5. **Final Convolution Block** → 512 filters
-   - 3×3 kernel + AdaptiveAvgPool → (1, 1)
-   
-6. **Fully Connected Classifier Head**
-   - Dense 512 → 256 (ReLU + Dropout 0.5)
-   - Dense 256 → 128 (ReLU + Dropout 0.3)
-   - Dense 128 → 2 (Binary classification: wake word vs background)
-
-**Architecture Details:**
-
-| Attribute | Value |
-|-----------|-------|
-| Total Parameters | ~250K+ |
-| Input Channels | 1 (mono mel-spectrogram) |
-| Output Classes | 2 (Positive/Negative) |
-| Activation | ReLU |
-| Normalization | BatchNorm2d after each conv |
-| Regularization | Dropout + residual connections |
-| Optimization | GPU-accelerated with AMP (mixed precision) |
-
-### Training Configuration
-
-| Parameter | Value |
-|-----------|-------|
-| Batch Size | 32 |
-| Max Epochs | 100 |
-| Optimizer | Adam |
-| Learning Rate | 0.001 |
-| Weight Decay | 1e-5 |
-| Early Stopping | patience = 15 epochs |
-| LR Scheduler | ReduceLROnPlateau (factor=0.5, patience=5) |
-| Loss Function | Weighted CrossEntropyLoss (handles class imbalance) |
-
-**Dataset Split:**
-- Training: 80%
-- Validation: 10%
-- Testing: 10%
+| Parameter | Value | Parameter | Value |
+|-----------|-------|-----------|-------|
+| Sample Rate | 16 kHz | Optimizer | Adam (lr 0.001) |
+| Duration | 1 s | Loss | Weighted CrossEntropy |
+| Mel Bands | 64 | Early Stopping | patience 15 |
+| Input Shape | (64, 32) | Split | 80 / 10 / 10 |
 
 ### Model Performance
-
-**Test Set Results:**
 
 | Metric | Value |
 |--------|-------|
 | Overall Accuracy | **~95%+** |
 | Macro F1-Score | **~95%** |
-| Training Stability | Early stopping (typically 30-50 epochs) |
+| Positive (رشدي) Precision / Recall | ~94% / ~96% |
+| Negative Precision / Recall | ~96% / ~95% |
 
-**Per-Class Performance:**
-
-**Negative Class (Background/Non-Wake Word):**
-- Precision: ~96%
-- Recall: ~95%
-
-**Positive Class (رشدي Wake Word):**
-- Precision: ~94%
-- Recall: ~96%
-
-**Training Efficiency:**
-- Early stopping prevents overfitting
-- Mixed precision training (AMP) enables 2-3x faster convergence on GPU
-- Real-time progress tracking with tqdm
-- Automatic checkpointing of best model
-
-### Running the Dataset Cleaner
-
-1. **Start the Flask server:**
-```bash
-cd wake_word/CLEANING/Voice\ commands
-python app.py
-```
-
-2. **Open in browser:**
-```
-http://localhost:5000
-```
-
-3. **For network access from other machines:**
-```
-http://<YOUR_LOCAL_IP>:5000
-```
-
-### Workflow
-
-1. **Load Sample** – Click "next" or wait for auto-load
-2. **Listen** – Play the audio
-3. **Label** – Click "Positive" (press `1`) or "Negative" (press `2`)
-4. **Repeat** – Automatically loads next sample
-
-### Running the Training Notebook
+### Usage
 
 ```bash
-cd wake_word/CLEANING/Voice\ commands
-jupyter notebook wake_word_final.ipynb
+cd "Voice commands"
+python app.py                       # start Flask annotation server → http://localhost:5000
+jupyter notebook wake_word_final.ipynb   # train the wake-word model
 ```
 
-Execute cells sequentially:
-- Cells 1-2: Imports and configuration setup
-- Cells 3-5: Data loading and exploration
-- Cells 6-9: Feature extraction and augmentation functions
-- Cells 10-15: Model architecture and training loop
-- Cells 16+: Evaluation, metrics, and visualization
+For full details, see [Voice commands/README.md](Voice%20commands/README.md).
+
+---
+
+## 4. Roshdi Mobile App (Flutter)
+
+**Location:** `rushdey/`
+
+The cross-platform Flutter application that unifies all three modules and runs them **offline, on-device**. Built with the `pytorch_lite` plugin, it bundles the exported models as assets:
+
+| Asset | Module |
+|-------|--------|
+| `assets/models/wake_word_trial2.ptl` + `config.json` | Voice Commands |
+| `assets/models/face_model.tflite` | Face Recognition |
+| `assets/models/currency_model.ptl` / `best.ptl` + `labels.txt` | Currency Detection |
+
+**Stack:** Flutter (Dart SDK ^3.11.1), `pytorch_lite ^4.3.2`, `image`, `shared_preferences`. Targets **Android, iOS, web, Windows, macOS, and Linux**.
+
+### Build & Run
+
+```bash
+cd rushdey
+flutter pub get
+flutter run            # run on a connected device / emulator
+flutter build apk      # Android release build (or: flutter build ios / web / windows)
+```
+
+> The app loads pre-trained models from `assets/models/`. After retraining a module, export it (`quantize.py` / `export_ptl.py`) and replace the corresponding asset, then update `pubspec.yaml` if filenames change.
 
 ---
 
 ## System Requirements
 
-### Python Environment
-- **Python:** ≥ 3.8
-- **CUDA:** Optional (GPU acceleration recommended)
+### Python (ML modules)
+- **Python** ≥ 3.8 — **CUDA** optional (GPU recommended)
+- Core libs: `torch`, `torchaudio`, `torchvision`, `tensorflow` (FR baseline export), `flask`, `librosa`, `scikit-learn`, `numpy`, `matplotlib`, `jupyter`, `pandas`, `soundfile`, `onnx`
 
-### Required Libraries
-
-```
-tensorflow >= 2.8
-torch >= 1.10
-torchaudio >= 0.10
-flask >= 2.0
-librosa >= 0.9
-scikit-learn >= 1.0
-numpy >= 1.20
-matplotlib >= 3.4
-jupyter
-scipy >= 1.7
-pandas >= 1.3
-soundfile >= 0.10
-```
-
-### Installation
+Each module ships its own `requirements.txt`:
 
 ```bash
-# Create virtual environment
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
+source venv/bin/activate            # Windows: venv\Scripts\activate
+pip install -r "Face Recognition/requirements.txt"
+pip install -r "Egyptian Currency Detection/requirements.txt"
 ```
 
----
-
-## Module Structure
-
-### Face Recognition
-
-**Location:** `Face_recognition/`
-
-Key files:
-- `best_model.h5` - Best performing model
-- `evaluate.py` - Model evaluation script
-- `recognize_person.py` - Real-time recognition
-- `enroll_person.py` - Enroll new identities
-
-For detailed instructions, see `Face_recognition/README.md`.
-
-### Currency Detection
-
-**Location:** `Currency_detection/`
-
-Key files:
-- `model.py` - CurrencyMobileNet architecture
-- `train.py` - Training script
-- `evaluate.py` - Evaluation script
-- `export_ptl.py` - Mobile export
-
-For detailed instructions, see `Currency_detection/README.md`.
-
-### Voice Commands
-
-**Location:** `wake_word/CLEANING/Voice commands/`
-
-Key files:
-- `app.py` - Flask annotation server
-- `wake_word_final.ipynb` - Training notebook
-- `templates/index.html` - Web UI
-
-For detailed instructions, see `wake_word/CLEANING/Voice commands/README.md`.
-
----
-
-## Future Integration
-
-The final system will integrate all three modules into a **unified mobile assistant application** capable of:
-
-- ✓ Listening for wake word activation (*"رشدي"*)
-- ✓ Identifying people via face recognition
-- ✓ Recognizing Egyptian currency denominations
-- ✓ Voice-based query responses
-- ✓ Haptic feedback for results
-
-This will enable **visually impaired users** to:
-- Identify who they're talking to
-- Determine the value of banknotes they're holding
-- Control the device through voice commands
-- Receive instant audio feedback
+### Mobile (Roshdi app)
+- **Flutter SDK** with Dart ^3.11.1 — run `flutter doctor` to verify your toolchain
 
 ---
 
@@ -583,30 +296,34 @@ This will enable **visually impaired users** to:
 
 | Field | Details |
 |-------|---------|
-| **Project Name** | Beyond The Limits |
+| **Project Name** | Beyond The Limits (Roshdi / رشدي) |
 | **Objective** | Assistive AI for visually impaired users |
 | **Type** | Graduation Project |
-| **Modules** | 3 (Face Recognition, Currency Detection, Voice Commands) |
-| **Framework** | TensorFlow/Keras, PyTorch, Flask |
-| **Target Platform** | Mobile (iOS/Android) + Desktop |
-| **Model Export** | TensorFlow Lite, TorchScript Lite |
+| **ML Modules** | 3 — Face Recognition, Currency Detection, Voice Commands |
+| **App** | Flutter cross-platform mobile/desktop (`rushdey/`) |
+| **Frameworks** | PyTorch, TensorFlow/Keras, Flask, Flutter |
+| **Target Platform** | Android / iOS (+ web & desktop) |
+| **Model Export** | TorchScript Lite (.ptl), TensorFlow Lite, ONNX, INT8 |
+
+---
+
+## Future Integration
+
+The Roshdi app brings the three modules together into a unified assistant that:
+
+- ✓ Listens for the wake word (*"رشدي"*)
+- ✓ Identifies people via face recognition
+- ✓ Recognizes Egyptian banknote denominations
+- ✓ Responds to voice queries with audio feedback
+
+Enabling visually impaired users to identify who they're talking to, determine the value of banknotes they're holding, and control the device entirely by voice.
 
 ---
 
 ## License & Attribution
 
-This is an academic project. See individual module READMEs for specific licensing information.
+This is an academic graduation project. See individual module READMEs for specific licensing and attribution.
 
 ---
 
-## Contact & Support
-
-For issues or questions about specific modules, refer to their individual README files:
-
-- [Face Recognition](Face_recognition/README.md)
-- [Currency Detection](Currency_detection/README.md)
-- [Voice Commands](wake_word/CLEANING/Voice%20commands/README.md)
-
----
-
-**Last Updated:** March 2026
+**Last Updated:** June 2026
