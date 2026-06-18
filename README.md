@@ -6,7 +6,7 @@ The system integrates three independent deep-learning modules plus the mobile ap
 
 1. **Voice Commands (Wake Word Detection)** – Activates the system via the Arabic wake word *"رشدي"*
 2. **Face Recognition** – Identifies registered individuals using a from-scratch PyTorch ArcFace model
-3. **Egyptian Currency Detection** – Recognizes Egyptian banknotes using a mobile-optimized CNN
+3. **Egyptian Currency Detection** – Detects, counts, and sums Egyptian banknotes with a YOLOv8 detector
 4. **Roshdi Mobile App** – A Flutter app that bundles all three models and runs them offline on the phone
 
 Each ML module is an independent subsystem that can be trained and evaluated on its own, then exported and embedded into the mobile app.
@@ -29,15 +29,22 @@ Roshdi graduation project/
 │   ├── requirements.txt
 │   └── README.md
 │
-├── Egyptian Currency Detection/  # PyTorch CurrencyMobileNet classifier
-│   ├── train.py
-│   ├── evaluate.py
-│   ├── model.py                  # CurrencyMobileNet (MobileNetV2-style)
-│   ├── infer.py / camera.py
-│   ├── export_ptl.py             # TorchScript Lite (.ptl) export
-│   ├── config.py / dataset.py / utils.py
-│   ├── generate_report.py / Progress_Report.pdf
-│   ├── outputs/
+├── Egyptian Currency Detection/  # YOLOv8 banknote detection + counting
+│   ├── src/
+│   │   ├── config.py             # paths, classes, hyperparameters
+│   │   ├── train.py              # YOLOv8 training
+│   │   ├── detect.py             # inference: image / folder / video / webcam
+│   │   ├── evaluate.py           # mAP / precision / recall on test split
+│   │   ├── explain.py            # Eigen-CAM / Grad-CAM saliency + reasoning
+│   │   ├── utils.py              # box drawing, count + total, JSON output
+│   │   ├── bootstrap_yolo_dataset.py
+│   │   ├── validators.py  logging_config.py  confidence_metrics.py
+│   │   ├── profiling.py  model_registry.py  mlflow_history.py
+│   ├── data_yolo/                # YOLO dataset (images + labels + data.yaml)
+│   ├── outputs/                  # training/eval runs, detections, logs
+│   ├── legacy/                   # previous CurrencyMobileNet classifier
+│   ├── tests/                    # unit + adversarial tests
+│   ├── *_REPORT.md/.pdf  MODEL_DESCRIPTION  FILE_GUIDE
 │   ├── requirements.txt
 │   └── README.md
 │
@@ -77,7 +84,7 @@ Voice Command Processing
         │
         └──→ Currency Detection
              │
-             └──→ Detect banknote value
+             └──→ Detect, count & sum banknotes
 ```
 
 The wake word activates the assistant, after which the requested model runs on-device and results are returned as audio feedback.
@@ -117,7 +124,6 @@ Built around an **iResNet-18** backbone trained **from scratch** on CASIA-WebFac
 | TP rate @ thr=0.45 (5 enrollments) | **100%** | 100% |
 | FP rate @ thr=0.45 | **8%** | — |
 | FP rate @ thr=0.50 | **2%** | — |
-| Embedding latency (MPS, batch 64) | 28 ms / face | 28 ms / face |
 | Real-time loop latency (480p, 1 face) | ~25 ms / frame | ~30 ms |
 
 The 79.65% LFW figure reflects a constrained training budget (1,000 of CASIA's 10,572 identities, ~10 effective epochs on Apple Silicon). The model is nonetheless production-ready at sensible thresholds (100% TP / 8% FP @ 0.45).
@@ -128,7 +134,6 @@ The 79.65% LFW figure reflects a constrained training budget (1,000 of CASIA's 1
 - **IoU + EMA multi-face tracker** with name voting and sticky labels
 - Optional **horizontal-flip TTA** at inference
 - **Novelty-gated rolling-window** online enrollment
-- 10-fold verification eval with TAR@FAR + ROC AUC
 - Edge export: **INT8 dynamic quantization + ONNX** (FP32/FP16)
 
 ### Usage
@@ -152,45 +157,70 @@ For full details, see [Face Recognition/README.md](Face%20Recognition/README.md)
 
 ### Purpose
 
-Recognizes Egyptian banknotes using a lightweight CNN designed for mobile devices.
+Detect, classify, **count, and sum** Egyptian banknotes in images, videos, or a live camera feed. Built on **YOLOv8 (Ultralytics)**, it outputs annotated media plus a JSON file with per-note detections, per-class counts, and the **total amount**.
+
+> This replaces the previous single-image classifier (now kept under `legacy/`). A classifier could only label one note per frame; YOLOv8 detects and classifies *every* note in one pass — handling overlap and giving bounding boxes — which is what makes multi-note counting possible.
 
 ### Supported Classes
 
-| Index | Banknote | Index | Banknote |
-|-------|----------|-------|----------|
-| 0 | 1 EGP | 5 | 20 EGP (new) |
-| 1 | 5 EGP | 6 | 50 EGP |
-| 2 | 10 EGP (old) | 7 | 100 EGP |
-| 3 | 10 EGP (new) | 8 | 200 EGP |
-| 4 | 20 EGP (old) | | |
+7 denominations (old/new variants of a note share one class, since they have the same value):
 
-### Model Architecture
+| ID | Class | Value | ID | Class | Value |
+|----|-------|-------|----|-------|-------|
+| 0 | 1_EGP | 1 | 4 | 50_EGP | 50 |
+| 1 | 5_EGP | 5 | 5 | 100_EGP | 100 |
+| 2 | 10_EGP | 10 | 6 | 200_EGP | 200 |
+| 3 | 20_EGP | 20 | | | |
 
-Custom **CurrencyMobileNet** inspired by MobileNetV2.
+### Model & Results
 
 | Attribute | Value |
 |-----------|-------|
-| Framework | PyTorch |
-| Total Parameters | ~2.2M |
-| FP32 Model Size | ~8.5 MB |
-| TorchScript Lite Size | ~8 MB |
+| Framework | YOLOv8 (Ultralytics) |
+| Task | Object detection + counting |
+| Detection mAP@0.5 | **0.982** |
+| Counting accuracy (after synthetic fine-tune) | 18% → **88%** |
+| Mobile export | TFLite / ONNX (`model.export(...)`) |
 
-**Key components:** depthwise separable convolutions, inverted residual blocks, ReLU6 activations, global average pooling.
+### Pipeline
 
-**Training features:** Kaiming init, label smoothing (α=0.1), weighted sampling for class imbalance, cosine annealing LR, mixed precision (AMP), gradient clipping.
+```
+Image / Video / Webcam
+        │
+        ▼
+YOLOv8 Detector  ──→  per-note boxes + class + confidence
+        │
+        ▼
+Count per class  +  Sum total EGP
+        │
+        ├──→ Annotated media (boxes + summary panel)
+        └──→ JSON (detections, counts, total, metadata)
+```
 
-**Augmentations** (for real-world variation — folded/worn notes, occlusion, lighting): random crop, rotation (±15°), perspective distortion, Gaussian blur, random erasing, color jitter.
+### Production Features (v2)
+
+- **Input validation** (`validators.py`) — corrupted/oversized images return structured error JSON instead of crashing
+- **Structured logging** (`logging_config.py`) — one JSONL event per detection under `outputs/logs/`
+- **Confidence + risk flags** (`confidence_metrics.py`) — each detection gets a `risk` label and known-confusion warnings (e.g. 50 ↔ 100 EGP)
+- **Visual explainability** (`explain.py`) — `--explain` produces an Eigen-CAM / Grad-CAM saliency heatmap + plain-language reasoning per note
+- **JSON schema v2** (`utils.py`) — adds `metadata` (timestamp, model version, inference time, image size), normalized bboxes, confidence stats (legacy fields retained)
+- **Performance profiling** (`profiling.py`), **model registry** (`model_registry.py`), and a **test suite** (`tests/`, unit + adversarial)
+- **MLflow project history** (`mlflow_history.py`) — every milestone (v1 classifier → YOLOv8 → counting fix → hardening → explainability) reconstructed as comparable MLflow runs
 
 ### Usage
 
 ```bash
 cd "Egyptian Currency Detection"
-pip install -r requirements.txt
-python train.py                                  # train
-python train.py --epochs 50 --batch-size 64 --lr 0.005   # custom
-python evaluate.py                               # evaluate on test set
-python infer.py        # single-image inference   (camera.py for live)
-python export_ptl.py                             # export model.ptl (TorchScript Lite)
+pip install -r requirements.txt              # pulls Ultralytics + a compatible torch
+
+# Prepare dataset (bootstrap YOLO labels from the legacy classification folders)
+python src/bootstrap_yolo_dataset.py --src "path/to/classification/data"
+
+python src/train.py                          # train (or --epochs 50 --batch 8 --model yolov8s.pt)
+python src/evaluate.py                        # mAP / precision / recall on test split
+
+python src/detect.py --image photo.jpg        # single image  (--image-dir / --video / --webcam)
+python src/detect.py --image photo.jpg --explain   # + saliency heatmap & reasoning
 ```
 
 For full details, see [Egyptian Currency Detection/README.md](Egyptian%20Currency%20Detection/README.md).
@@ -268,7 +298,7 @@ flutter run            # run on a connected device / emulator
 flutter build apk      # Android release build (or: flutter build ios / web / windows)
 ```
 
-> The app loads pre-trained models from `assets/models/`. After retraining a module, export it (`quantize.py` / `export_ptl.py`) and replace the corresponding asset, then update `pubspec.yaml` if filenames change.
+> The app loads pre-trained models from `assets/models/`. After retraining a module, export it (`quantize.py` / `model.export(...)`) and replace the corresponding asset, then update `pubspec.yaml` if filenames change.
 
 ---
 
@@ -276,7 +306,7 @@ flutter build apk      # Android release build (or: flutter build ios / web / wi
 
 ### Python (ML modules)
 - **Python** ≥ 3.8 — **CUDA** optional (GPU recommended)
-- Core libs: `torch`, `torchaudio`, `torchvision`, `tensorflow` (FR baseline export), `flask`, `librosa`, `scikit-learn`, `numpy`, `matplotlib`, `jupyter`, `pandas`, `soundfile`, `onnx`
+- Core libs: `torch`, `torchaudio`, `torchvision`, `ultralytics` (YOLOv8), `tensorflow` (FR baseline export), `flask`, `librosa`, `scikit-learn`, `numpy`, `matplotlib`, `jupyter`, `pandas`, `soundfile`, `onnx`, `mlflow`
 
 Each module ships its own `requirements.txt`:
 
@@ -299,9 +329,9 @@ pip install -r "Egyptian Currency Detection/requirements.txt"
 | **Project Name** | Beyond The Limits (Roshdi / رشدي) |
 | **Objective** | Assistive AI for visually impaired users |
 | **Type** | Graduation Project |
-| **ML Modules** | 3 — Face Recognition, Currency Detection, Voice Commands |
+| **ML Modules** | 3 — Face Recognition, Currency Detection (YOLOv8), Voice Commands |
 | **App** | Flutter cross-platform mobile/desktop (`rushdey/`) |
-| **Frameworks** | PyTorch, TensorFlow/Keras, Flask, Flutter |
+| **Frameworks** | PyTorch, Ultralytics YOLOv8, TensorFlow/Keras, Flask, Flutter |
 | **Target Platform** | Android / iOS (+ web & desktop) |
 | **Model Export** | TorchScript Lite (.ptl), TensorFlow Lite, ONNX, INT8 |
 
@@ -313,7 +343,7 @@ The Roshdi app brings the three modules together into a unified assistant that:
 
 - ✓ Listens for the wake word (*"رشدي"*)
 - ✓ Identifies people via face recognition
-- ✓ Recognizes Egyptian banknote denominations
+- ✓ Detects, counts, and sums Egyptian banknotes
 - ✓ Responds to voice queries with audio feedback
 
 Enabling visually impaired users to identify who they're talking to, determine the value of banknotes they're holding, and control the device entirely by voice.
