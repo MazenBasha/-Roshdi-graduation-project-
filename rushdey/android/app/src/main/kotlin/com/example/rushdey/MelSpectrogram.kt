@@ -19,40 +19,63 @@ class MelSpectrogram(
     /**
      * Compute mel spectrogram from audio samples
      * @param audioSamples Float array of audio samples (16kHz mono PCM)
-     * @return 2D FloatArray [nMels x timeSteps]
+     * @return 2D FloatArray [nMels x timeSteps], normalized to [0, 1]
      */
     fun compute(audioSamples: FloatArray): Array<FloatArray> {
         // 1. Compute STFT
         val stft = computeStft(audioSamples)
         
-        // 2. Compute magnitude spectrogram
-        val magnitudeSpec = stft.map { frame ->
-            frame.map { complex -> sqrt(complex.first * complex.first + complex.second * complex.second) }.toFloatArray()
+        // 2. Compute power spectrogram. Librosa's melspectrogram defaults to power=2.
+        val powerSpec = stft.map { frame ->
+            frame.map { complex -> complex.first * complex.first + complex.second * complex.second }.toFloatArray()
         }.toTypedArray()
         
         // 3. Apply mel filterbank
-        val melSpec = applyMelFilterbank(magnitudeSpec)
-        
-        // 4. Convert to log scale (add small epsilon to avoid log(0))
-        return melSpec.map { frame ->
-            frame.map { value -> ln(value + 1e-10f) }.toFloatArray()
-        }.toTypedArray()
+        val melSpec = applyMelFilterbank(powerSpec)
+
+        // 4. Convert to dB relative to max, clip to an 80 dB range, then normalize [0, 1].
+        val amin = 1e-10f
+        val maxPower = melSpec.flatMap { it.asIterable() }.maxOrNull()?.coerceAtLeast(amin) ?: amin
+        val refDb = 10f * log10(maxPower)
+        val dbFrames = melSpec.map { frame ->
+            frame.map { value ->
+                val db = 10f * log10(value.coerceAtLeast(amin)) - refDb
+                db.coerceAtLeast(-80f)
+            }.toFloatArray()
+        }
+
+        val minDb = dbFrames.flatMap { it.asIterable() }.minOrNull() ?: -80f
+        val maxDb = dbFrames.flatMap { it.asIterable() }.maxOrNull() ?: 0f
+        val range = (maxDb - minDb).coerceAtLeast(1e-6f)
+        val normalizedFrames = dbFrames.map { frame ->
+            frame.map { value -> (value - minDb) / range }.toFloatArray()
+        }
+
+        // Training produced (n_mels, n_frames). Internal STFT is frame-major, so transpose.
+        val frames = normalizedFrames.size
+        return Array(nMels) { mel ->
+            FloatArray(frames) { frame -> normalizedFrames[frame][mel] }
+        }
     }
 
     /**
      * Compute Short-Time Fourier Transform
      */
     private fun computeStft(signal: FloatArray): Array<Array<Pair<Float, Float>>> {
-        val numFrames = (signal.size - nFft) / hopLength + 1
+        // Match librosa's default center=True behavior by padding n_fft / 2 samples at both ends.
+        val paddedSignal = FloatArray(signal.size + nFft)
+        System.arraycopy(signal, 0, paddedSignal, nFft / 2, signal.size)
+
+        val numFrames = max(1, (paddedSignal.size - nFft) / hopLength + 1)
         val fftSize = nFft / 2 + 1
-        val window = hammingWindow(nFft)
+        val window = hannWindow(nFft)
         
         val stft = Array(numFrames) { Array(fftSize) { Pair(0f, 0f) } }
         
         for (frameIdx in 0 until numFrames) {
             val start = frameIdx * hopLength
             val frame = FloatArray(nFft) { i ->
-                if (start + i < signal.size) signal[start + i] * window[i] else 0f
+                if (start + i < paddedSignal.size) paddedSignal[start + i] * window[i] else 0f
             }
             
             stft[frameIdx] = rfft(frame)
@@ -134,11 +157,11 @@ class MelSpectrogram(
     }
 
     /**
-     * Hamming window function
+     * Hann window function, matching librosa's default STFT window.
      */
-    private fun hammingWindow(size: Int): FloatArray {
+    private fun hannWindow(size: Int): FloatArray {
         return FloatArray(size) { i ->
-            (0.54 - 0.46 * cos(2.0 * PI * i / (size - 1))).toFloat()
+            (0.5 - 0.5 * cos(2.0 * PI * i / (size - 1))).toFloat()
         }
     }
 

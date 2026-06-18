@@ -1,5 +1,5 @@
 name: rushdey
-description: "A new Flutter project."
+description: "Rushdey Arabic assistive mobile application for blind and visually impaired users."
 publish_to: 'none'
 
 version: 1.0.0+1
@@ -29,3 +29,4 @@ flutter:
     - assets/models/currency_model.ptl
     - assets/models/best.ptl
     - assets/models/labels.txt
+    - assets/tessdata/ara.traineddata

@@ -35,7 +35,7 @@ class FaceEngine(private val context: Context) {
     private var interpreter: Interpreter? = null
     private val inputSize = 112
     private val embeddingSize = 128
-    private val recognitionThreshold = 0.45f
+    private val recognitionThreshold = 0.985f
     private val modelAssetName = "assets/models/face_model.tflite"
     private val templatesFileName = "face_templates.json"
     private val faceDetector = FaceDetection.getClient(
@@ -165,14 +165,25 @@ class FaceEngine(private val context: Context) {
     fun extractEmbedding(imageBytes: ByteArray): FloatArray? {
         return try {
             val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-                ?: return null
-            val faceCrop = detectLargestFace(bitmap) ?: return null
+                ?: run {
+                    Log.w(TAG, "extractEmbedding: could not decode image")
+                    return null
+                }
+            val faceCrop = detectLargestFace(bitmap)
+            if (faceCrop == null) {
+                Log.w(TAG, "extractEmbedding: no face detected")
+                bitmap.recycle()
+                return null
+            }
             val resized = Bitmap.createScaledBitmap(faceCrop, inputSize, inputSize, true)
             val inputBuffer = bitmapToInputBuffer(resized)
 
             // Output: [1, 128]
             val outputBuffer = Array(1) { FloatArray(embeddingSize) }
             interpreter?.run(inputBuffer, outputBuffer)
+            if (resized !== faceCrop) resized.recycle()
+            faceCrop.recycle()
+            bitmap.recycle()
 
             val embedding = outputBuffer[0]
             l2Normalize(embedding)
@@ -217,6 +228,10 @@ class FaceEngine(private val context: Context) {
      */
     fun enrollPerson(name: String, imageBytesList: List<ByteArray>): Boolean {
         val embeddings = imageBytesList.mapNotNull { extractEmbedding(it) }
+        return enrollPersonFromEmbeddings(name, embeddings)
+    }
+
+    fun enrollPersonFromEmbeddings(name: String, embeddings: List<FloatArray>): Boolean {
         if (embeddings.isEmpty()) return false
 
         // Mean embedding
