@@ -2,7 +2,6 @@ package com.example.rushdey
 
 import android.content.Context
 import android.util.Log
-import io.flutter.FlutterInjector
 import io.flutter.plugin.common.EventChannel
 import kotlinx.coroutines.*
 import org.vosk.Model
@@ -12,7 +11,6 @@ import org.vosk.android.SpeechService
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
-import java.io.InputStream
 import java.net.URL
 
 /**
@@ -106,19 +104,39 @@ class VoskIntentEngine(
     private fun copyBundledModelIfNeeded(): File? {
         return try {
             val destDir = File(context.filesDir, modelDirName)
-            if (destDir.exists() && destDir.list()?.isNotEmpty() == true) return destDir
+            if (isUsableVoskDir(destDir)) return destDir
+
+            destDir.deleteRecursively()
             destDir.mkdirs()
-            val assetKey = try {
-                FlutterInjector.instance().flutterLoader()
-                        .getLookupKeyForAsset("assets/vosk_model")
-                    } catch (_: Exception) { "assets/vosk_model" }
-            context.assets.list(assetKey)?.forEach { file ->
-                context.assets.open("$assetKey/$file").use { input ->
-                    FileOutputStream(File(destDir, file)).use { it.write(input.readBytes()) }
-                }
+            copyAssetTree(modelDirName, destDir)
+            if (isUsableVoskDir(destDir)) destDir else null
+        } catch (e: Exception) {
+            Log.w(TAG, "No bundled Vosk model found in Android assets", e)
+            null
+        }
+    }
+
+    private fun isUsableVoskDir(dir: File): Boolean {
+        return File(dir, "am/final.mdl").exists() &&
+            File(dir, "graph/HCLr.fst").exists() &&
+            File(dir, "graph/Gr.fst").exists() &&
+            File(dir, "conf/model.conf").exists()
+    }
+
+    private fun copyAssetTree(assetPath: String, targetDir: File) {
+        val children = context.assets.list(assetPath).orEmpty()
+        if (children.isEmpty()) {
+            targetDir.parentFile?.mkdirs()
+            context.assets.open(assetPath).use { input ->
+                FileOutputStream(targetDir).use { output -> input.copyTo(output) }
             }
-            if (destDir.list()?.isNotEmpty() == true) destDir else null
-        } catch (_: Exception) { null }
+            return
+        }
+
+        targetDir.mkdirs()
+        children.forEach { child ->
+            copyAssetTree("$assetPath/$child", File(targetDir, child))
+        }
     }
 
     private fun downloadAndExtractModel(destDir: File) {

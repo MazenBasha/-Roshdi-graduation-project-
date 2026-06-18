@@ -33,10 +33,12 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.Locale
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.lifecycle.ProcessCameraProvider
+import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
     // Channel names
@@ -54,15 +56,20 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
     private var pendingCameraResult: MethodChannel.Result? = null
     private var pendingCameraIntent: String = ""   // "face" or "currency"
     private var pendingEnrollName: String = ""
-    private var enrollImageBytes: MutableList<ByteArray> = mutableListOf()
-    private var enrollPhotosNeeded = 3
-    private var enrollPhotosTaken = 0
+    private val enrollEmbeddings: MutableList<FloatArray> = mutableListOf()
+    private val enrollPhotosNeeded = 3
+    private val enrollMaxAttempts = 8
+    private val enrollCaptureDelayMs = 1200L
+    private var enrollCaptureAttempts = 0
 
     // ML Engines
     private lateinit var faceEngine: FaceEngine
     private lateinit var currencyEngine: CurrencyEngine
     private lateinit var ocrEngine: OCREngine
     private var voskEngine: VoskIntentEngine? = null
+    private var voskReady = false
+    private var voskInitializing = false
+    private var startIntentAfterVoskReady = false
     private var faceReady = false
     private var currencyReady = false
     private var ocrReady = false
@@ -75,8 +82,16 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
     private var audioFocusRequest: AudioFocusRequest? = null
 
     private var imageCapture: ImageCapture? = null
+    private var imageAnalysis: ImageAnalysis? = null
     private var cameraLensFacing: Int = CameraSelector.LENS_FACING_BACK
     private var cameraMirror: Boolean = false
+    private var cameraPreviewActive: Boolean = false
+    private var cameraPreviewFrozen: Boolean = false
+    private var cameraCaptureInProgress: Boolean = false
+    private var lastPreviewJpegBytes: ByteArray? = null
+    private var lastPreviewFrameAt: Long = 0L
+    private val previewFrameIntervalMs = 220L
+    private val cameraExecutor = Executors.newSingleThreadExecutor()
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -126,6 +141,8 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
                     "stopIntentListening"   -> handleStopIntentListening(result)
                     "setCameraConfig"       -> handleSetCameraConfig(call.arguments, result)
                     "getCameraConfig"       -> handleGetCameraConfig(result)
+                    "startCameraPreview"    -> handleStartCameraPreview(result)
+                    "stopCameraPreview"     -> handleStopCameraPreview(result)
                     "captureAndRecognizeFace"     -> handleCaptureFace(result)
                     "captureAndDetectCurrency"    -> handleCaptureCurrency(result)
                     "captureAndReadText"          -> handleCaptureOCR(result)
@@ -141,6 +158,12 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
             .setStreamHandler(object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
                     modelEventSink = events
+                    if (cameraPreviewActive) {
+                        sendModelEvent(mapOf("type" to if (cameraPreviewFrozen) "camera_frozen" else "camera_live"))
+                        lastPreviewJpegBytes?.let { bytes ->
+                            sendModelEvent(mapOf("type" to "camera_preview", "imageBytes" to bytes))
+                        }
+                    }
                 }
                 override fun onCancel(arguments: Any?) {
                     modelEventSink = null
@@ -163,11 +186,29 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
                 imageCapture = ImageCapture.Builder()
                     .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                     .build()
+                imageAnalysis = if (cameraPreviewActive) {
+                    ImageAnalysis.Builder()
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .build()
+                        .also { analysis ->
+                            analysis.setAnalyzer(cameraExecutor) { image ->
+                                handlePreviewFrame(image)
+                            }
+                        }
+                } else {
+                    null
+                }
                 val cameraSelector = CameraSelector.Builder()
                     .requireLensFacing(cameraLensFacing)
                     .build()
                 cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(this, cameraSelector, imageCapture)
+                val capture = imageCapture
+                val analysis = imageAnalysis
+                if (cameraPreviewActive && analysis != null && capture != null) {
+                    cameraProvider.bindToLifecycle(this, cameraSelector, capture, analysis)
+                } else if (capture != null) {
+                    cameraProvider.bindToLifecycle(this, cameraSelector, capture)
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "CameraX init failed", e)
             }
@@ -281,8 +322,8 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
             currencyReady = currencyEngine.initialize()
             Log.i(TAG, "CurrencyEngine ready: $currencyReady")
             
-            ocrEngine = OCREngine()
-            ocrReady = true // No heavy init for ML Kit
+            ocrEngine = OCREngine(this@MainActivity)
+            ocrReady = ocrEngine.initialize()
             Log.i(TAG, "OCREngine ready: $ocrReady")
 
             withContext(Dispatchers.Main) {
@@ -297,34 +338,53 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun handleInitModels(result: MethodChannel.Result) {
-        // Init Vosk engine (async — may download model)
-        if (voskEngine == null) {
-            voskEngine = VoskIntentEngine(this) { modelEventSink }
-            voskEngine?.initialize { ready ->
-                sendModelEvent(mapOf("type" to "vosk_ready", "ready" to ready))
-            }
-        }
-        result.success(mapOf("face" to faceReady, "currency" to false))
+        ensureVoskInitialized(startAfterReady = false)
+        result.success(mapOf("face" to faceReady, "currency" to currencyReady, "ocr" to ocrReady))
     }
 
     // ─────────────────────── Intent Listening ────────────────────────────────
 
     private fun handleStartIntentListening(result: MethodChannel.Result) {
-        if (voskEngine == null) {
-            voskEngine = VoskIntentEngine(this) { modelEventSink }
-            voskEngine?.initialize { ready ->
-                if (ready) voskEngine?.startListening()
-                sendModelEvent(mapOf("type" to "vosk_ready", "ready" to ready))
-            }
-        } else {
+        if (voskReady) {
             voskEngine?.startListening()
+        } else {
+            sendModelEvent(mapOf("type" to "vosk_status", "status" to "preparing_model"))
+            ensureVoskInitialized(startAfterReady = true)
         }
         result.success(true)
     }
 
     private fun handleStopIntentListening(result: MethodChannel.Result) {
+        startIntentAfterVoskReady = false
         voskEngine?.stopListening()
         result.success(true)
+    }
+
+    private fun ensureVoskInitialized(startAfterReady: Boolean) {
+        if (voskReady) {
+            if (startAfterReady) voskEngine?.startListening()
+            return
+        }
+
+        if (startAfterReady) startIntentAfterVoskReady = true
+        if (voskInitializing) return
+
+        voskInitializing = true
+        if (voskEngine == null) {
+            voskEngine = VoskIntentEngine(this) { modelEventSink }
+        }
+        voskEngine?.initialize { ready ->
+            voskInitializing = false
+            voskReady = ready
+            sendModelEvent(mapOf("type" to "vosk_ready", "ready" to ready))
+            if (ready && startIntentAfterVoskReady) {
+                startIntentAfterVoskReady = false
+                voskEngine?.startListening()
+            } else if (!ready) {
+                startIntentAfterVoskReady = false
+                sendModelEvent(mapOf("type" to "intent_error", "message" to "Vosk model not available"))
+            }
+        }
     }
 
     private fun handleSetCameraConfig(args: Any?, result: MethodChannel.Result) {
@@ -358,6 +418,56 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
 
     // ─────────────────────── Camera + Inference ───────────────────────────────
 
+    private fun handleStartCameraPreview(result: MethodChannel.Result) {
+        if (!hasCameraPermission()) {
+            requestCameraPermission(result, "preview")
+            return
+        }
+        startPreviewStream()
+        result.success(true)
+    }
+
+    private fun startPreviewStream() {
+        cameraPreviewActive = true
+        cameraPreviewFrozen = false
+        lastPreviewFrameAt = 0L
+        if (imageCapture == null || imageAnalysis == null) {
+            initCamera()
+        }
+        sendModelEvent(mapOf("type" to "camera_live"))
+        lastPreviewJpegBytes?.let { bytes ->
+            sendModelEvent(mapOf("type" to "camera_preview", "imageBytes" to bytes))
+        }
+    }
+
+    private fun handleStopCameraPreview(result: MethodChannel.Result) {
+        cameraPreviewActive = false
+        cameraPreviewFrozen = false
+        if (pendingCameraIntent.isBlank()) {
+            shutdownCamera()
+        }
+        result.success(true)
+    }
+
+    private fun handlePreviewFrame(image: ImageProxy) {
+        try {
+            if (!cameraPreviewActive || cameraPreviewFrozen || modelEventSink == null) return
+            val now = System.currentTimeMillis()
+            if (now - lastPreviewFrameAt < previewFrameIntervalMs) return
+            lastPreviewFrameAt = now
+            val bytes = imageProxyToPreviewJpegBytes(image, cameraMirror) ?: return
+            lastPreviewJpegBytes = bytes
+            sendModelEvent(mapOf(
+                "type" to "camera_preview",
+                "imageBytes" to bytes
+            ))
+        } catch (e: Exception) {
+            Log.w(TAG, "Preview frame failed", e)
+        } finally {
+            image.close()
+        }
+    }
+
     private fun handleCaptureFace(result: MethodChannel.Result) {
         if (!hasCameraPermission()) {
             requestCameraPermission(result, "face")
@@ -365,6 +475,7 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
         }
         pendingCameraResult = result
         pendingCameraIntent = "face"
+        startPreviewStream()
         launchCamera()
     }
 
@@ -375,32 +486,56 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
         }
         pendingCameraResult = result
         pendingCameraIntent = "currency"
+        startPreviewStream()
         launchCamera()
     }
 
     private fun launchCamera() {
+        if (cameraCaptureInProgress) {
+            Log.w(TAG, "Photo capture requested while another capture is still running")
+            mainHandler.postDelayed({
+                if (pendingCameraIntent.isNotBlank()) launchCamera()
+            }, 350L)
+            return
+        }
+        if (cameraPreviewActive && imageAnalysis == null) {
+            initCamera()
+        }
         if (imageCapture == null) {
             initCamera()
             mainHandler.postDelayed({ launchCamera() }, 500)
             return
         }
 
+        cameraCaptureInProgress = true
         imageCapture?.takePicture(ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(image: ImageProxy) {
-                val bytes = imageProxyToJpegBytes(image, cameraMirror)
-                    ?: run {
-                        val buffer = image.planes[0].buffer
-                        val fallback = ByteArray(buffer.capacity())
-                        buffer.get(fallback)
-                        fallback
+                val bytes = try {
+                    imageProxyToJpegBytes(image, cameraMirror)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Image conversion failed", e)
+                    null
+                } finally {
+                    image.close()
+                    cameraCaptureInProgress = false
+                } ?: run {
+                    val fallback = lastPreviewJpegBytes
+                    if (fallback == null) {
+                        handleCameraCaptureFailure("تعذر التقاط الصورة")
+                        return
                     }
-                image.close()
+                    fallback
+                }
 
+                cameraPreviewFrozen = cameraPreviewActive
+                lastPreviewJpegBytes = bytes
                 sendModelEvent(mapOf(
-                    "type" to "camera_preview",
+                    "type" to "camera_frozen",
                     "imageBytes" to bytes
                 ))
-                shutdownCamera()
+                if (!cameraPreviewActive) {
+                    shutdownCamera()
+                }
                 
                 when {
                     pendingCameraIntent == "face"     -> runFaceInference(bytes)
@@ -411,13 +546,27 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
             }
 
             override fun onError(exception: ImageCaptureException) {
+                cameraCaptureInProgress = false
                 Log.e(TAG, "Photo capture failed: ${exception.message}", exception)
-                shutdownCamera()
-                val result = pendingCameraResult
-                pendingCameraResult = null
-                result?.error("CAMERA_ERROR", exception.message, null)
+                handleCameraCaptureFailure(exception.message ?: "Photo capture failed")
             }
         })
+    }
+
+    private fun handleCameraCaptureFailure(message: String) {
+        if (!cameraPreviewActive) {
+            shutdownCamera()
+        } else {
+            cameraPreviewFrozen = false
+            sendModelEvent(mapOf("type" to "camera_live"))
+            lastPreviewJpegBytes?.let { bytes ->
+                sendModelEvent(mapOf("type" to "camera_preview", "imageBytes" to bytes))
+            }
+        }
+        val result = pendingCameraResult
+        pendingCameraResult = null
+        pendingCameraIntent = ""
+        result?.error("CAMERA_ERROR", message, null)
     }
 
     private fun shutdownCamera() {
@@ -428,6 +577,8 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
             Log.w(TAG, "Failed to shutdown camera", e)
         } finally {
             imageCapture = null
+            imageAnalysis = null
+            cameraCaptureInProgress = false
         }
     }
 
@@ -440,7 +591,47 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
             out.toByteArray()
         } finally {
             if (finalBitmap !== bitmap) finalBitmap.recycle()
+            bitmap.recycle()
         }
+    }
+
+    private fun imageProxyToPreviewJpegBytes(image: ImageProxy, mirror: Boolean): ByteArray? {
+        val bitmap = imageProxyToBitmap(image) ?: return null
+        val mirrored = if (mirror) mirrorBitmap(bitmap) else bitmap
+        val maxWidth = 640
+        val scale = if (mirrored.width > maxWidth) maxWidth.toFloat() / mirrored.width.toFloat() else 1f
+        val previewBitmap = if (scale < 1f) {
+            Bitmap.createScaledBitmap(
+                mirrored,
+                maxOf(1, (mirrored.width * scale).toInt()),
+                maxOf(1, (mirrored.height * scale).toInt()),
+                true
+            )
+        } else {
+            mirrored
+        }
+        return try {
+            val out = ByteArrayOutputStream()
+            previewBitmap.compress(Bitmap.CompressFormat.JPEG, 65, out)
+            out.toByteArray()
+        } finally {
+            if (previewBitmap !== mirrored) previewBitmap.recycle()
+            if (mirrored !== bitmap) mirrored.recycle()
+            bitmap.recycle()
+        }
+    }
+
+    private fun releaseCameraFreeze(delayMs: Long = 1800L) {
+        if (!cameraPreviewActive) return
+        mainHandler.postDelayed({
+            if (cameraPreviewActive) {
+                cameraPreviewFrozen = false
+                sendModelEvent(mapOf("type" to "camera_live"))
+                lastPreviewJpegBytes?.let { bytes ->
+                    sendModelEvent(mapOf("type" to "camera_preview", "imageBytes" to bytes))
+                }
+            }
+        }, delayMs)
     }
 
     private fun imageProxyToBitmap(image: ImageProxy): Bitmap? {
@@ -454,18 +645,7 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
             return rotated
         }
 
-        val yBuffer = image.planes[0].buffer
-        val uBuffer = image.planes[1].buffer
-        val vBuffer = image.planes[2].buffer
-
-        val ySize = yBuffer.remaining()
-        val uSize = uBuffer.remaining()
-        val vSize = vBuffer.remaining()
-
-        val nv21 = ByteArray(ySize + uSize + vSize)
-        yBuffer.get(nv21, 0, ySize)
-        vBuffer.get(nv21, ySize, vSize)
-        uBuffer.get(nv21, ySize + vSize, uSize)
+        val nv21 = yuv420ToNv21(image)
 
         val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
         val out = ByteArrayOutputStream()
@@ -477,6 +657,41 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
         val rotated = rotateBitmapIfNeeded(bmp, image.imageInfo.rotationDegrees)
         if (rotated !== bmp) bmp.recycle()
         return rotated
+    }
+
+    private fun yuv420ToNv21(image: ImageProxy): ByteArray {
+        val width = image.width
+        val height = image.height
+        val ySize = width * height
+        val nv21 = ByteArray(ySize + 2 * (width / 2) * (height / 2))
+
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+        val yBuffer = yPlane.buffer
+        val uBuffer = uPlane.buffer
+        val vBuffer = vPlane.buffer
+
+        var outputOffset = 0
+        for (row in 0 until height) {
+            val rowOffset = row * yPlane.rowStride
+            for (col in 0 until width) {
+                nv21[outputOffset++] = yBuffer.get(rowOffset + col * yPlane.pixelStride)
+            }
+        }
+
+        val chromaWidth = width / 2
+        val chromaHeight = height / 2
+        var chromaOffset = ySize
+        for (row in 0 until chromaHeight) {
+            val uRowOffset = row * uPlane.rowStride
+            val vRowOffset = row * vPlane.rowStride
+            for (col in 0 until chromaWidth) {
+                nv21[chromaOffset++] = vBuffer.get(vRowOffset + col * vPlane.pixelStride)
+                nv21[chromaOffset++] = uBuffer.get(uRowOffset + col * uPlane.pixelStride)
+            }
+        }
+        return nv21
     }
 
     private fun mirrorBitmap(bitmap: Bitmap): Bitmap {
@@ -492,6 +707,7 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
     private fun runCurrencyInference(imageBytes: ByteArray) {
         val result = pendingCameraResult
         pendingCameraResult = null
+        pendingCameraIntent = ""
 
         CoroutineScope(Dispatchers.IO).launch {
             val currResult = if (currencyReady) {
@@ -514,6 +730,7 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
                     "total"      to currResult.total,
                     "ttsText"    to currResult.arabicName
                 ))
+                releaseCameraFreeze()
             }
         }
     }
@@ -521,6 +738,7 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
     private fun runOCRInference(imageBytes: ByteArray) {
         val result = pendingCameraResult
         pendingCameraResult = null
+        pendingCameraIntent = ""
 
         CoroutineScope(Dispatchers.IO).launch {
             val text = if (ocrReady) {
@@ -536,6 +754,7 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
                     "imageBytes" to imageBytes
                 ))
                 result?.success(mapOf("text" to text))
+                releaseCameraFreeze()
             }
         }
     }
@@ -547,6 +766,7 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
         }
         pendingCameraResult = result
         pendingCameraIntent = "ocr"
+        startPreviewStream()
         launchCamera()
     }
 
@@ -558,6 +778,7 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
     private fun runFaceInference(imageBytes: ByteArray) {
         val result = pendingCameraResult
         pendingCameraResult = null
+        pendingCameraIntent = ""
 
         CoroutineScope(Dispatchers.IO).launch {
             val faceResult = if (faceReady) {
@@ -569,6 +790,7 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
                     val msg = "نموذج التعرف على الوجوه غير جاهز"
                     speak(msg)
                     result?.success(mapOf("error" to msg))
+                    releaseCameraFreeze()
                     return@withContext
                 }
 
@@ -596,6 +818,7 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
                     "recognized" to faceResult.recognized,
                     "ttsText"    to ttsText
                 ))
+                releaseCameraFreeze()
             }
         }
     }
@@ -620,20 +843,73 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
             result.error("INVALID_ARGS", "Name is required", null)
             return
         }
+        if (!faceReady) {
+            val msg = "\u0646\u0645\u0648\u0630\u062c \u0627\u0644\u062a\u0639\u0631\u0641 \u0639\u0644\u0649 \u0627\u0644\u0648\u062c\u0648\u0647 \u063a\u064a\u0631 \u062c\u0627\u0647\u0632"
+            speak(msg)
+            result.error("FACE_NOT_READY", msg, null)
+            return
+        }
         if (!hasCameraPermission()) {
             requestCameraPermission(result, "enroll:$name")
             return
         }
         pendingEnrollName = name
-        enrollImageBytes.clear()
-        enrollPhotosTaken = 0
+        enrollEmbeddings.clear()
+        enrollCaptureAttempts = 0
         pendingCameraResult = result
         pendingCameraIntent = "enroll"
+        startPreviewStream()
         sendModelEvent(mapOf("type" to "enroll_start", "name" to name, "photosNeeded" to enrollPhotosNeeded))
+        speak("\u062b\u0628\u062a \u0648\u0634 \u0627\u0644\u0634\u062e\u0635 \u0642\u062f\u0627\u0645 \u0627\u0644\u0643\u0627\u0645\u064a\u0631\u0627")
         launchCamera()
     }
 
     private fun runEnrollCapture(imageBytes: ByteArray) {
+        enrollCaptureAttempts++
+        CoroutineScope(Dispatchers.IO).launch {
+            val embedding = faceEngine.extractEmbedding(imageBytes)
+            withContext(Dispatchers.Main) {
+                if (embedding != null) {
+                    enrollEmbeddings.add(embedding)
+                    val taken = enrollEmbeddings.size
+                    sendModelEvent(mapOf(
+                        "type"     to "enroll_progress",
+                        "taken"    to taken,
+                        "needed"   to enrollPhotosNeeded,
+                        "attempts" to enrollCaptureAttempts,
+                        "clear"    to true
+                    ))
+                    speak("\u062a\u0645 \u0627\u0644\u062a\u0642\u0627\u0637 \u0635\u0648\u0631\u0629 \u0648\u0627\u0636\u062d\u0629 $taken \u0645\u0646 $enrollPhotosNeeded")
+                } else {
+                    sendModelEvent(mapOf(
+                        "type"     to "enroll_progress",
+                        "taken"    to enrollEmbeddings.size,
+                        "needed"   to enrollPhotosNeeded,
+                        "attempts" to enrollCaptureAttempts,
+                        "clear"    to false
+                    ))
+                    if (enrollCaptureAttempts == 1 || enrollCaptureAttempts % 2 == 0) {
+                        speak("\u0645\u0634 \u0634\u0627\u064a\u0641 \u0648\u0634 \u0648\u0627\u0636\u062d. \u0642\u0631\u0628 \u0627\u0644\u0648\u0634 \u0648\u062b\u0628\u062a\u0647 \u0642\u062f\u0627\u0645 \u0627\u0644\u0643\u0627\u0645\u064a\u0631\u0627")
+                    }
+                }
+
+                when {
+                    enrollEmbeddings.size >= enrollPhotosNeeded -> finishEnrollment(success = true)
+                    enrollCaptureAttempts >= enrollMaxAttempts -> finishEnrollment(
+                        success = false,
+                        userMessage = "\u0645\u0634 \u0634\u0627\u064a\u0641 \u0648\u0634 \u0648\u0627\u0636\u062d. \u0642\u0631\u0628 \u0627\u0644\u0648\u0634 \u0648\u062e\u0644\u064a\u0647 \u0641\u064a \u0625\u0636\u0627\u0621\u0629 \u0643\u0648\u064a\u0633\u0629.",
+                        errorMessage = "Could not capture enough clear face embeddings"
+                    )
+                    else -> {
+                        releaseCameraFreeze(delayMs = 350L)
+                        mainHandler.postDelayed({ launchCamera() }, enrollCaptureDelayMs)
+                    }
+                }
+            }
+        }
+    }
+
+    /*
         enrollImageBytes.add(imageBytes)
         enrollPhotosTaken++
         sendModelEvent(mapOf(
@@ -665,6 +941,50 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
                         sendModelEvent(mapOf("type" to "enroll_done", "name" to name, "success" to false))
                         result?.error("ENROLL_FAILED", "Could not extract embeddings", null)
                     }
+                }
+            }
+        }
+    }
+
+    */
+
+    private fun finishEnrollment(
+        success: Boolean,
+        userMessage: String? = null,
+        errorMessage: String? = null
+    ) {
+        val result = pendingCameraResult
+        pendingCameraResult = null
+        pendingCameraIntent = ""
+        val name = pendingEnrollName
+        val embeddings = enrollEmbeddings.toList()
+        enrollEmbeddings.clear()
+        enrollCaptureAttempts = 0
+
+        if (!success) {
+            val msg = userMessage ?: "\u0641\u0634\u0644 \u062a\u0633\u062c\u064a\u0644 $name"
+            speak(msg)
+            sendModelEvent(mapOf("type" to "enroll_done", "name" to name, "success" to false, "message" to msg))
+            releaseCameraFreeze()
+            result?.error("ENROLL_FAILED", errorMessage ?: msg, null)
+            return
+        }
+
+        CoroutineScope(Dispatchers.IO).launch {
+            val ok = faceEngine.enrollPersonFromEmbeddings(name, embeddings)
+            withContext(Dispatchers.Main) {
+                if (ok) {
+                    val msg = "\u062a\u0645 \u062a\u0633\u062c\u064a\u0644 $name \u0628\u0646\u062c\u0627\u062d"
+                    speak(msg)
+                    sendModelEvent(mapOf("type" to "enroll_done", "name" to name, "success" to true, "message" to msg))
+                    releaseCameraFreeze()
+                    result?.success(mapOf("success" to true, "name" to name))
+                } else {
+                    val msg = "\u0641\u0634\u0644 \u062a\u0633\u062c\u064a\u0644 $name"
+                    speak(msg)
+                    sendModelEvent(mapOf("type" to "enroll_done", "name" to name, "success" to false, "message" to msg))
+                    releaseCameraFreeze()
+                    result?.error("ENROLL_FAILED", "Could not save enrollment", null)
                 }
             }
         }
@@ -723,15 +1043,26 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
                 if (granted) {
                     initCamera()
                     when {
-                        pendingCameraIntent == "face"     -> launchCamera()
-                        pendingCameraIntent == "currency" -> {
-                            pendingCameraIntent = "currency_flutter"
-                            launchCamera()
+                        pendingCameraIntent == "preview"  -> {
+                            cameraPreviewActive = true
+                            cameraPreviewFrozen = false
+                            pendingCameraIntent = ""
+                            val result = pendingCameraResult
+                            pendingCameraResult = null
+                            initCamera()
+                            sendModelEvent(mapOf("type" to "camera_live"))
+                            result?.success(true)
                         }
-                        pendingCameraIntent == "currency_flutter" -> launchCamera()
+                        pendingCameraIntent == "face"     -> launchCamera()
+                        pendingCameraIntent == "currency" -> launchCamera()
+                        pendingCameraIntent == "ocr"      -> launchCamera()
                         pendingCameraIntent.startsWith("enroll:") -> {
                             pendingEnrollName = pendingCameraIntent.substringAfter("enroll:")
+                            enrollEmbeddings.clear()
+                            enrollCaptureAttempts = 0
                             pendingCameraIntent = "enroll"
+                            startPreviewStream()
+                            sendModelEvent(mapOf("type" to "enroll_start", "name" to pendingEnrollName, "photosNeeded" to enrollPhotosNeeded))
                             launchCamera()
                         }
                     }
@@ -776,7 +1107,10 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
         super.onDestroy()
         tts?.shutdown()
         if (::faceEngine.isInitialized) faceEngine.release()
+        if (::currencyEngine.isInitialized) currencyEngine.release()
+        if (::ocrEngine.isInitialized) ocrEngine.release()
         voskEngine?.release()
+        cameraExecutor.shutdown()
     }
 
     companion object {

@@ -1,0 +1,11 @@
+flask
+numpy
+torch
+torchaudio
+librosa
+soundfile
+scipy
+scikit-learn
+matplotlib
+jupyter
+mlflow

@@ -17,9 +17,11 @@ import org.json.JSONObject
 
 class WakeWordService : Service() {
     private var voskSpeechService: SpeechService? = null
+    private var pytorchWakeWordEngine: WakeWordModelEngine? = null
     
     private var isListening = false
     private var hasDetectedInCurrentWindow = false
+    private var currentEngine = "pytorch"
     
     private var eventSink: EventChannel.EventSink? = null
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -38,7 +40,8 @@ class WakeWordService : Service() {
         
         when (intent?.action) {
             ACTION_START_LISTENING -> {
-                startListening()
+                val engine = intent.getStringExtra(EXTRA_ENGINE_TYPE) ?: "pytorch"
+                startListening(engine)
             }
             ACTION_STOP_LISTENING -> stopListening()
             ACTION_STOP_SERVICE -> {
@@ -52,13 +55,52 @@ class WakeWordService : Service() {
     
     override fun onBind(intent: Intent?): IBinder? = null
     
-    private fun startListening() {
-        if (isListening) return
+    private fun startListening(engine: String) {
+        if (isListening) stopListening()
         hasDetectedInCurrentWindow = false
+        currentEngine = engine
+
+        if (engine == "pytorch") {
+            startPytorchListening()
+            return
+        }
         
         // Initialize engines in background to avoid blocking main thread and causing ANRs
         CoroutineScope(Dispatchers.IO).launch {
             initVoskAndStart()
+        }
+    }
+
+    private fun startPytorchListening() {
+        pytorchWakeWordEngine?.release()
+        pytorchWakeWordEngine = WakeWordModelEngine(
+            context = this,
+            onEvent = { event -> sendEvent(event) },
+            onDetected = { confidence ->
+                if (!hasDetectedInCurrentWindow) {
+                    hasDetectedInCurrentWindow = true
+                    Log.i(TAG, "PyTorch wake word detected with confidence=$confidence")
+                    stopListening()
+                    sendEvent(mapOf(
+                        "type" to "detected",
+                        "wakeWord" to "رشدي",
+                        "confidence" to confidence
+                    ))
+                }
+            }
+        )
+
+        val started = pytorchWakeWordEngine?.start() == true
+        if (started) {
+            isListening = true
+            sendEvent(mapOf("type" to "status", "status" to "listening", "engine" to "pytorch"))
+            Log.i(TAG, "PyTorch Wake Word listening started")
+        } else {
+            Log.w(TAG, "PyTorch wake word failed; falling back to Vosk wake word")
+            sendEvent(mapOf("type" to "status", "status" to "fallback_vosk"))
+            CoroutineScope(Dispatchers.IO).launch {
+                initVoskAndStart()
+            }
         }
     }
     
@@ -108,7 +150,7 @@ class WakeWordService : Service() {
                     })
                 }
                 isListening = true
-                sendEvent(mapOf("type" to "status", "status" to "listening"))
+                sendEvent(mapOf("type" to "status", "status" to "listening", "engine" to "vosk"))
                 Log.i(TAG, "Vosk Wake Word listening started")
             } catch (e: Exception) {
                 sendError(e.message ?: "Failed to start Vosk")
@@ -126,8 +168,8 @@ class WakeWordService : Service() {
             
             if (target.contains("رشدي") && !hasDetectedInCurrentWindow) {
                 hasDetectedInCurrentWindow = true
-                // Stop vosk immediately to prevent multiple triggers
-                voskSpeechService?.stop()
+                // Stop immediately to prevent multiple triggers
+                stopListening()
                 
                 Log.i(TAG, "Vosk Wake word detected! '$target'")
                 sendEvent(mapOf(
@@ -141,6 +183,7 @@ class WakeWordService : Service() {
     
     private fun stopListening() {
         if (!isListening) return
+        pytorchWakeWordEngine?.stop()
         voskSpeechService?.apply {
             stop()
             shutdown()
@@ -213,6 +256,8 @@ class WakeWordService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         stopListening()
+        pytorchWakeWordEngine?.release()
+        pytorchWakeWordEngine = null
         /* isInitialized = false */
         serviceInstance = null
         Log.i(TAG, "WakeWordService destroyed")

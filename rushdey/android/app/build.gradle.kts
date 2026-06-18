@@ -33,9 +33,9 @@ android {
         }
     }
 
-    // Required for TFLite SELECT_TF_OPS (MobileFaceNet custom ops)
+    // Keep model/training-data assets uncompressed so native runtimes can map/copy them reliably.
     aaptOptions {
-        noCompress += listOf("tflite", "ptl", "pt")
+        noCompress += listOf("tflite", "ptl", "pt", "traineddata")
     }
 }
 
@@ -73,8 +73,9 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$camerax_version")
     implementation("androidx.camera:camera-lifecycle:$camerax_version")
 
-    // ML Kit Text Recognition (Standard)
-    implementation("com.google.mlkit:text-recognition:16.0.0")
+    // Offline Arabic OCR through Tesseract and bundled ara.traineddata
+    implementation("cz.adaptech.tesseract4android:tesseract4android:4.9.0")
+    implementation("com.google.mlkit:text-recognition:16.0.1")
 
     // ML Kit Face Detection
     implementation("com.google.mlkit:face-detection:16.1.6")

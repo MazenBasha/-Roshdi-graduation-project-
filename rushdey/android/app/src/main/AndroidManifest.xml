@@ -49,6 +49,14 @@
             android:exported="false"
             android:foregroundServiceType="microphone" />
 
+        <receiver
+            android:name=".StaticImageTestReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.example.rushdey.RUN_IMAGE_TESTS" />
+            </intent-filter>
+        </receiver>
+
         <!-- FileProvider for camera photo sharing -->
         <provider
             android:name="androidx.core.content.FileProvider"
