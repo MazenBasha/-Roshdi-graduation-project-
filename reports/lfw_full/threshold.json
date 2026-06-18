@@ -1,0 +1,7 @@
+{
+  "label": "audit_iresnet18",
+  "threshold": 0.3753393665158372,
+  "source": "kfold mean of fold thresholds",
+  "eer_threshold": 0.3542079000637449,
+  "eer": 0.20294252873563218
+}

@@ -1,0 +1,23 @@
+# Claude Code
+.claude/
+CLAUDE.md
+.claude*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# macOS
+.DS_Store
+.venv/
+data/
+mlartifacts/
+logs/
+__pycache__/
+checkpoints/
+reports/xai/
+reports/xai_demo_gallery/
+reports/xai_demo_probes/
+face_db/
+mlflow.db

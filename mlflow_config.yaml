@@ -1,0 +1,21 @@
+# MLflow configuration for the Face Recognition Gilan project.
+#
+# Override any of these at runtime with the matching MLflow env var (e.g.
+#   MLFLOW_TRACKING_URI=http://my-mlflow.example.com python train.py ...
+# ). The defaults below are tuned for a local file store under ./mlruns.
+
+# Where MLflow records runs. SQLite is the supported local backend in
+# mlflow>=3.0 (the legacy file store is in maintenance mode and required for
+# Model Registry features anyway). Artifacts are written under ./mlartifacts.
+# Override with the MLFLOW_TRACKING_URI env var for a remote server.
+tracking_uri: sqlite:///mlflow.db
+artifact_location: ./mlartifacts
+
+# Default experiment name. Each script may override per-call.
+experiment_name: face-recognition-gilan
+
+# Model Registry name used by `register_best_model`.
+registered_model_name: face-recognition-iresnet
+
+# Set MLFLOW_DISABLED=1 in the environment to make every helper a no-op,
+# useful for unit tests / quick smoke runs that should not pollute mlruns/.

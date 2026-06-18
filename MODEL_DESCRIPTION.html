@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>Face Recognition Model - Description and Flutter Integration</title>
+<style>
+@page { size: A4; margin: 18mm 16mm 20mm 16mm; }
+html, body { font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+             color: #1a1a1a; line-height: 1.45; font-size: 10.5pt; }
+body { max-width: 100%; margin: 0; padding: 0; }
+h1 { font-size: 22pt; border-bottom: 3px solid #1f3a93; padding-bottom: 4px;
+     color: #1f3a93; margin-top: 0.4em; }
+h2 { font-size: 15pt; color: #1f3a93; border-bottom: 1px solid #ccd; padding-bottom: 2px;
+     margin-top: 1.4em; page-break-after: avoid; }
+h3 { font-size: 12.5pt; color: #1f3a93; margin-top: 1.2em; page-break-after: avoid; }
+h4 { font-size: 11pt; color: #34495e; margin-top: 1em; page-break-after: avoid; }
+p, li { font-size: 10.5pt; }
+table { border-collapse: collapse; width: 100%; margin: 0.6em 0 1.2em 0;
+        font-size: 9.5pt; page-break-inside: avoid; }
+th, td { border: 1px solid #c0c5cc; padding: 5px 7px; text-align: left; vertical-align: top; }
+th { background: #eef2f9; color: #1f3a93; font-weight: 600; }
+tr:nth-child(even) td { background: #f8fafd; }
+code { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 9.5pt;
+       background: #f3f5f9; padding: 1px 4px; border-radius: 3px; color: #c0392b; }
+pre { background: #f3f5f9; padding: 10px 12px; border-left: 3px solid #1f3a93;
+      border-radius: 3px; overflow-x: auto; page-break-inside: avoid; font-size: 9pt; }
+pre code { background: transparent; padding: 0; color: #1a1a1a; }
+blockquote { border-left: 3px solid #888; color: #444; padding: 4px 12px;
+             background: #fafafa; margin: 0.6em 0; font-style: italic; }
+ul, ol { margin: 0.4em 0 0.8em 1.4em; }
+hr { border: none; border-top: 1px solid #ccd; margin: 1.4em 0; }
+strong { color: #111; }
+@media print { h2, h3, h4 { page-break-after: avoid; } }
+</style>
+</head><body><h1>Face Recognition Model — Description &amp; Flutter Integration</h1>
+<h2>1. Model Overview</h2>
+<p>The project trains a <strong>face embedding model</strong> (not a classifier). Given a
+face image, it produces a 512-dimensional vector that uniquely represents
+that person's identity. Two faces of the same person produce vectors that
+are <em>close</em> (high cosine similarity); two different people produce vectors
+that are <em>far apart</em>.</p>
+<h3>Architecture</h3>
+<ul>
+<li><strong>Backbone:</strong> iResNet (Improved ResNet) — variants <code>iresnet18</code>,
+  <code>iresnet34</code>, <code>iresnet50</code>, <code>iresnet100</code>. Default for production:
+  <code>iresnet50</code>. The currently trained checkpoints in <code>checkpoints/</code> use
+  <code>iresnet18</code> (faster, mobile-friendly).</li>
+<li><strong>Loss:</strong> Two-stage training in <code>train.py</code>:
+  1. Stage 1 — <code>CosineHead</code> warmup with plain cross-entropy on scaled
+     cosine logits.
+  2. Stage 2 — <code>ArcFaceHead</code> with additive angular margin
+     (m = 0.5, s = 64), based on Deng et al. (CVPR 2019).</li>
+<li><strong>Pretrained fallback:</strong> If no trained checkpoint is on disk,
+  <code>inference.py</code> falls back to <code>facenet_vggface2</code>
+  (InceptionResnetV1 from <code>facenet-pytorch</code>), so the system works
+  out-of-the-box.</li>
+</ul>
+<h3>Files</h3>
+<ul>
+<li><code>model.py</code> — backbone + heads</li>
+<li><code>train.py</code> — two-stage training loop</li>
+<li><code>inference.py</code> — end-to-end recognition pipeline</li>
+<li><code>quantize.py</code> — INT8 / ONNX export for edge deployment</li>
+<li><code>config.py</code> — central hyperparameters</li>
+</ul>
+<hr>
+<h2>2. Inputs</h2>
+<h3>Training input (<code>train.py</code>)</h3>
+<ul>
+<li>A face dataset directory or MXNet RecordIO (e.g., CASIA-WebFace, MS1MV2).</li>
+<li>Images are pre-aligned to <strong>112 × 112 RGB</strong> using 5-point landmarks
+  and ArcFace's canonical template (<code>utils.align_face</code>).</li>
+<li>Each image carries an integer class label (person ID).</li>
+</ul>
+<h3>Inference input (<code>FaceRecognizer.recognize_image</code>)</h3>
+<ul>
+<li>A single BGR image as a <code>numpy.ndarray</code> of shape <code>(H, W, 3)</code> —
+  the raw output of <code>cv2.imread</code> or a webcam frame.</li>
+<li>The pipeline internally:
+  1. Runs MTCNN to detect faces and 5 landmarks.
+  2. Aligns each face to a 112×112 BGR crop.
+  3. Applies CLAHE (optional) and normalizes to <code>[-1, 1]</code>.
+  4. Feeds the batch tensor <code>(N, 3, 112, 112)</code> to the backbone.</li>
+</ul>
+<h3>Model tensor input (raw)</h3>
+<ul>
+<li><strong>Shape:</strong> <code>(B, 3, 112, 112)</code></li>
+<li><strong>Dtype:</strong> <code>float32</code></li>
+<li><strong>Range:</strong> <code>[-1, 1]</code> (i.e., <code>(pixel/255 - 0.5) / 0.5</code>)</li>
+<li><strong>Channel order:</strong> RGB</li>
+</ul>
+<hr>
+<h2>3. Outputs</h2>
+<h3>Model raw output</h3>
+<ul>
+<li><strong>Shape:</strong> <code>(B, 512)</code></li>
+<li><strong>Dtype:</strong> <code>float32</code></li>
+<li><strong>Semantics:</strong> face embedding. After L2 normalization, two
+  embeddings can be compared with cosine similarity (a simple dot
+  product on unit vectors).</li>
+</ul>
+<h3><code>FaceRecognizer.recognize_image(image)</code> — Python API</h3>
+<p>Returns a list of <code>FaceResult</code> (one per detected face):</p>
+<pre><code class="language-python">FaceResult(
+  bbox: np.ndarray,         # [x1, y1, x2, y2]
+  landmarks: np.ndarray,    # (5, 2)
+  detection_score: float,   # MTCNN confidence
+  embedding: np.ndarray,    # (512,) L2-normalized
+  name: str | None,         # None means &quot;unknown&quot;
+  similarity: float,        # best cosine vs the face DB
+  aligned_face: np.ndarray, # 112x112 BGR crop
+)
+</code></pre>
+<h3><code>FaceRecognizer.recognize_image_dicts(image)</code> — JSON-friendly</h3>
+<p>Returns a list of dicts (the shape used by the multi-person API):</p>
+<pre><code class="language-json">[
+  {
+    &quot;name&quot;: &quot;Ali&quot;,
+    &quot;confidence&quot;: 0.823,
+    &quot;bbox&quot;: [120, 88, 254, 260],
+    &quot;detection_score&quot;: 0.998
+  },
+  {
+    &quot;name&quot;: &quot;Unknown&quot;,
+    &quot;confidence&quot;: 0.21,
+    &quot;bbox&quot;: [310, 95, 412, 240],
+    &quot;detection_score&quot;: 0.991
+  }
+]
+</code></pre>
+<p>A face is labeled <code>"Unknown"</code> when its best cosine similarity to the
+face DB is below <code>MATCH_THRESHOLD</code> (default 0.40 in <code>config.py</code>).</p>
+<hr>
+<h2>4. Linking the Model with Flutter</h2>
+<p>There are three deployment patterns. Pick one based on whether the
+phone has internet and how much compute you want on-device.</p>
+<h3>Option A — Python HTTP/WebSocket server (recommended for Roshdi)</h3>
+<p>Wrap <code>FaceRecognizer</code> in a small FastAPI / Flask server and let the
+Flutter app upload frames over the network. This is the simplest
+and most accurate path, since the full PyTorch model runs on the
+server (laptop, Jetson, cloud).</p>
+<p><strong>Server side (<code>server.py</code>, sketch):</strong></p>
+<pre><code class="language-python">from fastapi import FastAPI, UploadFile
+import cv2, numpy as np
+from inference import FaceRecognizer
+
+app = FastAPI()
+rec = FaceRecognizer()  # loads checkpoint + face DB once at startup
+
+@app.post(&quot;/recognize&quot;)
+async def recognize(file: UploadFile):
+    data = np.frombuffer(await file.read(), np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    return {&quot;faces&quot;: rec.recognize_image_dicts(img)}
+
+@app.post(&quot;/enroll&quot;)
+async def enroll(name: str, file: UploadFile):
+    data = np.frombuffer(await file.read(), np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    n = rec.enroll_from_image(img, name)
+    return {&quot;enrolled&quot;: n}
+</code></pre>
+<p>Run with: <code>uvicorn server:app --host 0.0.0.0 --port 8000</code></p>
+<p><strong>Flutter side:</strong></p>
+<pre><code class="language-dart">import 'package:http/http.dart' as http;
+import 'package:image_picker/image_picker.dart';
+import 'dart:convert';
+
+Future&lt;List&lt;dynamic&gt;&gt; recognize(String imagePath) async {
+  final uri = Uri.parse('http://&lt;server-ip&gt;:8000/recognize');
+  final req = http.MultipartRequest('POST', uri)
+    ..files.add(await http.MultipartFile.fromPath('file', imagePath));
+  final res = await req.send();
+  final body = await res.stream.bytesToString();
+  return jsonDecode(body)['faces'];
+}
+</code></pre>
+<p>Each item in the returned list has <code>name</code>, <code>confidence</code>, <code>bbox</code>,
+<code>detection_score</code> — draw the boxes on a <code>CustomPaint</code> over the camera
+preview, and speak the names via <code>flutter_tts</code> for the assistive use
+case.</p>
+<p>For real-time camera streams, replace the multipart upload with a
+WebSocket that sends JPEG-encoded frames at ~5–10 FPS.</p>
+<h3>Option B — On-device ONNX (offline, mobile)</h3>
+<p><code>quantize.py</code> already exports an ONNX file (see
+<code>checkpoints/iresnet18.onnx</code>). Run it on the phone via the
+<code>onnxruntime</code> Flutter binding.</p>
+<ol>
+<li>Export the embedding model:
+   <code>python quantize.py \
+     --checkpoint checkpoints/two_stage_v2_iresnet18.best.pt \
+     --backbone iresnet18 \
+     --out-onnx checkpoints/iresnet18.onnx</code></li>
+<li>Bundle <code>iresnet18.onnx</code> as a Flutter asset.</li>
+<li>In <code>pubspec.yaml</code>:
+   ```yaml
+   dependencies:
+     onnxruntime: ^1.4.1
+     google_mlkit_face_detection: ^0.10.0   # for detection + landmarks
+     image: ^4.0.0
+   flutter:
+     assets:<ul>
+<li>assets/iresnet18.onnx
+   ```</li>
+</ul>
+</li>
+<li>In Dart:
+   - Use <code>google_mlkit_face_detection</code> to get bounding boxes and
+     landmarks.
+   - Crop and warp each face to 112×112 (the same alignment template
+     as <code>utils.align_face</code>).
+   - Convert to a <code>Float32List</code> of shape <code>[1, 3, 112, 112]</code>,
+     normalized to <code>[-1, 1]</code>, channel order RGB.
+   - Run the ONNX session — output is <code>[1, 512]</code>.
+   - L2-normalize, then cosine-compare against your stored embeddings
+     (a JSON file in app storage).</li>
+</ol>
+<h3>Option C — TensorFlow Lite (smallest binary, Android-friendly)</h3>
+<p>Convert the ONNX file to TFLite via <code>onnx-tf</code> or <code>onnx2tf</code> and run
+through the <code>tflite_flutter</code> package. The model I/O contract is
+identical (input <code>[1, 3, 112, 112]</code> float32, output <code>[1, 512]</code>
+float32).</p>
+<hr>
+<h2>5. Quick Reference (cheat sheet)</h2>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Backbone</td>
+<td>iResNet50 (prod) / iResNet18 (mobile)</td>
+</tr>
+<tr>
+<td>Loss</td>
+<td>ArcFace (s=64, m=0.5)</td>
+</tr>
+<tr>
+<td>Input shape</td>
+<td><code>(B, 3, 112, 112)</code> float32, RGB, range <code>[-1, 1]</code></td>
+</tr>
+<tr>
+<td>Output shape</td>
+<td><code>(B, 512)</code> float32 embedding</td>
+</tr>
+<tr>
+<td>Compare with</td>
+<td>Cosine similarity (dot product after L2 norm)</td>
+</tr>
+<tr>
+<td>Match threshold</td>
+<td>0.40 (configurable in <code>config.py</code>)</td>
+</tr>
+<tr>
+<td>Detection</td>
+<td>MTCNN, min face 40 px, conf ≥ 0.90</td>
+</tr>
+<tr>
+<td>Mobile export</td>
+<td><code>quantize.py</code> → ONNX or INT8</td>
+</tr>
+<tr>
+<td>Flutter recommended</td>
+<td>HTTP/WebSocket to Python server (Option A)</td>
+</tr>
+</tbody>
+</table></body></html>
