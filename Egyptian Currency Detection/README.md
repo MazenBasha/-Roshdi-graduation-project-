@@ -1,210 +1,352 @@
-# Egyptian Currency Detection - Mobile Model
+# Egyptian Currency Detection (YOLOv8)
 
-A lightweight currency classification model for Egyptian banknotes, trained entirely from scratch using PyTorch and exported as TorchScript Lite (`.ptl`) for mobile deployment.
+Detect, classify, count, and sum Egyptian banknotes in images, videos, or a
+live camera feed. Built on YOLOv8 (ultralytics). Outputs annotated media plus
+a JSON file with per-note detections, per-class counts, and the total amount.
 
-## Classes
+Supports 7 denominations: **1, 5, 10, 20, 50, 100, 200 EGP**.
 
-| Index | Class | Description |
-|-------|-------|-------------|
-| 0 | 1 | 1 EGP |
-| 1 | 5 | 5 EGP |
-| 2 | 10 | 10 EGP (old) |
-| 3 | 10 (new) | 10 EGP (new) |
-| 4 | 20 | 20 EGP (old) |
-| 5 | 20 (new) | 20 EGP (new) |
-| 6 | 50 | 50 EGP |
-| 7 | 100 | 100 EGP |
-| 8 | 200 | 200 EGP |
-
-## Architecture
-
-**CurrencyMobileNet** — A MobileNetV2-inspired architecture built entirely from scratch:
-
-- **Depthwise separable convolutions** reduce computation by ~8-9x vs standard convolutions
-- **Inverted residual blocks** with expansion ratios for efficient feature extraction
-- **ReLU6 activations** are quantization-friendly for mobile deployment
-- **Global average pooling** eliminates large FC layers
-- **~2.2M parameters** (FP32: ~8.5 MB, Lite: ~8 MB)
-- **No pretrained weights** — all layers are Kaiming-initialized and trained from scratch
-
-### Why this architecture?
-
-1. **Mobile-optimized**: Depthwise separable convolutions provide the best accuracy/FLOPS tradeoff
-2. **Small model size**: Fits comfortably on mobile devices
-3. **Fast inference**: ~15-30ms on modern mobile CPUs
-4. **Quantization-ready**: ReLU6 and BatchNorm make it easy to quantize further
-
-## Project Structure
+## Project layout
 
 ```
-├── config.py          # All hyperparameters and paths
-├── dataset.py         # Dataset loading, validation, augmentation
-├── model.py           # CurrencyMobileNet architecture
-├── utils.py           # Metrics, early stopping, checkpointing, logging
-├── train.py           # Training loop with AMP, scheduling, early stopping
-├── evaluate.py        # Test set evaluation with full metrics
-├── infer.py           # Single image / batch inference
-├── export_ptl.py      # Export to TorchScript Lite (.ptl)
-├── requirements.txt   # Python dependencies
-├── README.md          # This file
-├── data/
-│   ├── train/         # Training images (class subfolders)
-│   ├── valid/         # Validation images
-│   └── test/          # Test images
-└── outputs/
-    ├── best_model.pth # Best checkpoint
-    ├── model.ptl      # Exported mobile model
-    ├── checkpoints/   # Periodic checkpoints
-    └── logs/          # Training CSV logs
+Egyptian Currency Detection/
+├── src/
+│   ├── config.py                  # all paths, classes, hyperparameters
+│   ├── train.py                   # YOLOv8 training
+│   ├── detect.py                  # inference: image / folder / video / webcam
+│   ├── evaluate.py                # mAP / precision / recall on test split
+│   ├── explain.py                 # Eigen-CAM / Grad-CAM saliency + reasoning
+│   ├── utils.py                   # box drawing, count + total, JSON output
+│   └── bootstrap_yolo_dataset.py  # convert classification folders -> YOLO format
+├── data_yolo/
+│   ├── data.yaml        # dataset spec (edit only if you rename classes)
+│   ├── images/{train,val,test}/   # *.jpg
+│   └── labels/{train,val,test}/   # *.txt (YOLO format)
+├── outputs/
+│   ├── runs/            # training + eval runs (weights, plots)
+│   └── detections/      # annotated images / videos + JSON files
+├── legacy/              # the previous classification-only project
+├── requirements.txt
+└── README.md
 ```
 
-## Setup
+## Install
 
-```bash
+```powershell
 pip install -r requirements.txt
 ```
 
-## Commands
+`ultralytics` will pull a compatible torch build automatically. For GPU,
+install the matching CUDA torch wheel from https://pytorch.org first.
 
-### 1. Validate Dataset
+## 1. Prepare the dataset
 
-```bash
-python dataset.py
+### Quick start: bootstrap from the existing classification dataset
+
+If you already have the classification-style dataset
+(`<root>/{train,valid,test}/<class>/*.jpg`), generate a YOLO version with
+pseudo-labels (whole image = one box) in one command:
+
+```powershell
+python src/bootstrap_yolo_dataset.py --src "e:/data/egyptian_currency/data"
 ```
 
-### 2. Verify Model Architecture
+This copies images into `data_yolo/images/{train,val,test}/` and writes a
+matching `.txt` per image with a full-image bounding box. Old/new variants of
+the same denomination are merged (`10` + `10 (new)` → `10_EGP`). Result:
 
-```bash
-python model.py
+- 2637 train / 760 val / 290 test
+- 7 classes mapped from 9 source folders
+
+You can train immediately with this. **But heads up:** every label is a
+single full-image box, so the model will learn to detect single notes well,
+not overlapping or multiple notes in one frame. To get real multi-note
+performance, re-label a subset (especially multi-note shots) by hand —
+section below.
+
+### Real bounding-box labels (recommended for production accuracy)
+
+YOLO needs **bounding boxes**, not just folders. For each training image, you
+write a `.txt` file with one line per visible note:
+
+```
+<class_id> <x_center> <y_center> <width> <height>
 ```
 
-### 3. Train
+All four coords are floats in `[0, 1]`, normalized by image width / height.
 
-```bash
-# Default training (100 epochs, batch size 32, cosine LR)
-python train.py
+**Class IDs (must match `data_yolo/data.yaml`):**
 
-# Custom training
-python train.py --epochs 50 --batch-size 64 --lr 0.005
+| ID | Class    | Value |
+|----|----------|-------|
+| 0  | 1_EGP    | 1     |
+| 1  | 5_EGP    | 5     |
+| 2  | 10_EGP   | 10    |
+| 3  | 20_EGP   | 20    |
+| 4  | 50_EGP   | 50    |
+| 5  | 100_EGP  | 100   |
+| 6  | 200_EGP  | 200   |
 
-# Resume from checkpoint
-python train.py --resume outputs/checkpoints/checkpoint_epoch_10.pth
+> Note: old vs. new note variants of the same denomination share one class —
+> they have the same monetary value, which is what the counter cares about.
+
+**Easiest tooling:**
+- [Roboflow](https://roboflow.com) — upload images, draw boxes in the browser,
+  export as "YOLOv8". Drop the exported `images/` and `labels/` folders into
+  `data_yolo/`.
+- [LabelImg](https://github.com/HumanSignal/labelImg) — desktop tool, set
+  format to "YOLO".
+
+**How much to label:** aim for ~80 / 10 / 10 split between train / val / test.
+Realistic minimum is ~50 images per class for a working demo, ~150+ per class
+for solid accuracy. Mix single-note shots with multi-note scenes (overlapping,
+folded, bad lighting) so the detector learns to count properly.
+
+After labeling, your tree should look like:
+
+```
+data_yolo/
+  images/train/img_0001.jpg
+  labels/train/img_0001.txt
+  images/val/...
+  labels/val/...
+  images/test/...
+  labels/test/...
+  data.yaml
 ```
 
-### 4. Evaluate on Test Set
+## 2. Train
 
-```bash
-# Evaluate best model on test set
-python evaluate.py
-
-# Evaluate on validation set with visualization
-python evaluate.py --split valid --save-viz
-
-# Evaluate specific checkpoint
-python evaluate.py --checkpoint outputs/checkpoints/checkpoint_epoch_50.pth
+```powershell
+python src/train.py
+# or with custom settings:
+python src/train.py --epochs 50 --batch 8 --model yolov8s.pt
+# resume the last interrupted run:
+python src/train.py --resume
 ```
 
-### 5. Export to TorchScript Lite
+Training augmentations (set in `src/train.py`) are tuned for hand-held
+currency photos: HSV jitter (lighting), rotation ±20°, perspective, scale,
+translate, mosaic (synthesizes multi-note scenes from single notes), and
+mixup. `flipud` is kept low because notes are rarely upside-down in the wild.
 
-```bash
-# Export best model (with mobile optimizations)
-python export_ptl.py
-
-# Export without optimizations
-python export_ptl.py --no-optimize
-
-# Custom paths
-python export_ptl.py --checkpoint outputs/best_model.pth --output outputs/model.ptl
+Output:
+```
+outputs/runs/train/weights/best.pt
+outputs/runs/train/weights/last.pt
+outputs/runs/train/results.png         # loss + mAP curves
+outputs/runs/train/confusion_matrix.png
 ```
 
-### 6. Run Inference
+## 3. Evaluate
 
-```bash
-# Single image
-python infer.py --image path/to/currency_image.jpg
-
-# Directory of images
-python infer.py --image-dir path/to/images/
-
-# Using exported mobile model
-python infer.py --image path/to/image.jpg --model outputs/model.ptl
-
-# Top-5 predictions
-python infer.py --image path/to/image.jpg --top-k 5
+```powershell
+python src/evaluate.py                 # uses best.pt on test split
+python src/evaluate.py --split val
 ```
 
-## Training Features
+Reports mAP@0.5, mAP@0.5:0.95, precision, recall, per-class breakdown, and
+saves a confusion matrix and PR curves under `outputs/runs/eval/`.
 
-- **From-scratch training**: All weights randomly initialized (Kaiming)
-- **Class imbalance handling**: Weighted sampling + weighted loss
-- **Label smoothing**: 0.1 for regularization
-- **Data augmentation**: Random crop, flip, rotation, color jitter, perspective distortion, Gaussian blur, random erasing
-- **Mixed precision (AMP)**: Faster training on GPU
-- **Cosine annealing LR**: Smooth learning rate decay
-- **Early stopping**: Patience of 15 epochs
-- **Gradient clipping**: Max norm 5.0 for stability
-- **Reproducible**: Fixed seeds across all random sources
+## 4. Detect
 
-## Robustness
-
-The augmentation pipeline is designed to handle:
-- Folded/wrinkled notes → RandomResizedCrop, RandomPerspective
-- Partial occlusion → RandomErasing, RandomResizedCrop
-- Varying lighting → ColorJitter (brightness, contrast, saturation)
-- Scale variation → RandomResizedCrop with wide scale range
-- Motion blur → GaussianBlur
-- Worn/old currency → ColorJitter, aggressive augmentation
-- Rotated notes → RandomRotation (±30°)
-- Perspective distortion → RandomPerspective
-
-## Mobile Integration (Android/Kotlin)
-
-```kotlin
-// Load model
-val module = LiteModuleLoader.load(assetFilePath(this, "model.ptl"))
-
-// Preprocess image (224x224, normalized)
-val inputTensor = TensorImageUtils.bitmapToFloat32Tensor(
-    bitmap,
-    floatArrayOf(0.485f, 0.456f, 0.406f),  // mean
-    floatArrayOf(0.229f, 0.224f, 0.225f)   // std
-)
-
-// Run inference
-val output = module.forward(IValue.from(inputTensor)).toTensor()
-val scores = output.dataAsFloatArray
-
-// Get predicted class
-val maxIdx = scores.indices.maxByOrNull { scores[it] } ?: 0
-val classNames = arrayOf("1", "5", "10", "10 (new)", "20", "20 (new)", "50", "100", "200")
-val prediction = classNames[maxIdx]
-val confidence = softmax(scores)[maxIdx]
+### Single image
+```powershell
+python src/detect.py --image path/to/photo.jpg
 ```
 
-## Mobile Integration (iOS/Swift)
-
-```swift
-// Load model
-let module = try! TorchModule(fileAtPath: modelPath)
-
-// Preprocess image (224x224, normalized with mean/std)
-let inputTensor = preprocess(image: uiImage)  // Your preprocessing function
-
-// Run inference
-let output = module.predict(input: inputTensor)
-
-// Get predicted class
-let classNames = ["1", "5", "10", "10 (new)", "20", "20 (new)", "50", "100", "200"]
-let maxIdx = output.enumerated().max(by: { $0.element < $1.element })!.offset
-let prediction = classNames[maxIdx]
+### Folder of images
+```powershell
+python src/detect.py --image-dir path/to/folder
 ```
 
-## Evaluation Metrics
+### Video file
+```powershell
+python src/detect.py --video path/to/clip.mp4
+```
 
-The evaluation script reports:
-- **Accuracy**: Overall classification accuracy
-- **Precision**: Per-class and macro-averaged
-- **Recall**: Per-class and macro-averaged  
-- **F1 Score**: Per-class and macro-averaged
-- **mAP**: Mean Average Precision (classification)
-- **Confusion Matrix**: Full NxN matrix
+### Webcam
+```powershell
+python src/detect.py --webcam
+python src/detect.py --webcam --camera 1     # second camera
+```
+
+### Tuning
+```powershell
+python src/detect.py --image x.jpg --conf 0.5 --iou 0.45
+python src/detect.py --image x.jpg --weights outputs/runs/train2/weights/best.pt
+```
+
+`--no-show` runs without an OpenCV preview window (useful on servers).
+
+### Explainability (why did the model output this?)
+```powershell
+python src/detect.py --image x.jpg --explain
+python src/detect.py --image x.jpg --explain --explain-method gradcam
+```
+`--explain` writes an extra `<stem>_explain.jpg` saliency heatmap and adds a
+`salience_ratio` + plain-language `explanation` to every detection in the JSON,
+on top of the existing `confidence` / `risk` / `warning` fields. Two methods:
+
+- **`eigencam`** (default) — robust, class-agnostic saliency from the principal
+  component of the Detect-head feature maps. Clean, well-localized heatmaps; the
+  recommended choice for reports and screenshots.
+- **`gradcam`** — class-discriminative Grad-CAM tied to each detection's
+  IoU-matched anchors ("why *this* denomination"). More faithful to the class
+  decision, but can be diffuse on YOLO's anchor-free head.
+
+`salience_ratio` is mean(heatmap inside the box) / mean(heatmap overall): `>1`
+means the model attends to the note more than the image average; `~1` is normal
+when a note fills the frame; `<1` flags reliance on surrounding context.
+
+## Output format
+
+For every input image / frame the detector saves:
+
+1. An **annotated image / video** with bounding boxes, class label, confidence,
+   and a top-left summary panel listing per-class counts and the total.
+2. A **JSON** file matching this schema:
+
+```json
+{
+  "detections": [
+    {"class": "100_EGP", "confidence": 0.94, "bbox": [x1, y1, x2, y2]},
+    {"class": "100_EGP", "confidence": 0.91, "bbox": [x1, y1, x2, y2]},
+    {"class": "50_EGP",  "confidence": 0.88, "bbox": [x1, y1, x2, y2]}
+  ],
+  "counts": { "100_EGP": 2, "50_EGP": 1 },
+  "total": 250
+}
+```
+
+Bounding boxes are in absolute image pixel coordinates (`x1, y1` = top-left,
+`x2, y2` = bottom-right).
+
+## Tips for higher accuracy
+
+- **Label quality > label quantity.** Tight, consistent boxes beat thousands
+  of loose ones. Box exactly the printed paper area, not the table around it.
+- **Cover hard cases in training:** overlapping notes, partial occlusion,
+  folded notes, both faces of the bill, low light, blurry photos.
+- **Watch the confusion matrix** after training. If 10 ↔ 20 confusion is
+  high, add more examples of those two classes in similar lighting.
+- **Adjust `--conf`** at inference: lower (e.g. `0.25`) finds more notes but
+  raises false positives; raise it (e.g. `0.5`) for cleaner, stricter
+  detections.
+- For mobile deployment, export with `model.export(format="tflite")` or
+  `format="onnx"` after training.
+
+## New Features (v2.0)
+
+Production hardening that ships alongside the same single CLI - no API
+servers, no architectural changes, fully backward compatible.
+
+- **Robust input validation** (`src/validators.py`) - missing, corrupted, or
+  oversized images return a structured error JSON instead of crashing.
+- **Structured logging** (`src/logging_config.py`) - one JSONL line per event
+  written to `outputs/logs/detection_<timestamp>.jsonl`, plus human-readable
+  console output.
+- **Confidence + risk flags** (`src/confidence_metrics.py`) - every detection
+  gets a `risk` label (`low`/`medium`/`high`/`reject`) and known-confusion
+  classes (50 ↔ 100 EGP, rare 1 EGP) get a `warning` field.
+- **Visual explainability** (`src/explain.py`) - `--explain` produces an
+  Eigen-CAM / Grad-CAM saliency heatmap plus a per-detection `salience_ratio`
+  and plain-language `explanation`, answering *why* the model output each note.
+- **Enhanced JSON schema v2** (`src/utils.py`) - includes `metadata`
+  (timestamp, model version, inference time, image size), normalized bboxes,
+  and confidence statistics. Legacy `detections` / `counts` / `total` fields
+  are still present.
+- **Performance profiling** (`src/profiling.py`) - `PerformanceProfiler`
+  benchmarks single calls or batches (latency, memory, throughput).
+- **Model registry** (`src/model_registry.py`) - track trained models in
+  `outputs/model_registry.json`, switch the active model, roll back safely.
+- **Test suite** (`tests/`) - unit tests for validators, utils, confidence;
+  adversarial tests for extreme brightness, blur, rotation, etc.
+
+## Project history (MLflow)
+
+The full evolution of the project — from the v1 classification baseline through
+the YOLOv8 switch, the multi-note counting fix, production hardening, and the
+explainability feature — is reconstructed as MLflow runs so it can be browsed
+and compared on one timeline.
+
+```powershell
+# Log every milestone as an MLflow run (idempotent — safe to re-run)
+python src/mlflow_history.py
+
+# Browse the timeline in the MLflow UI
+mlflow ui --backend-store-uri sqlite:///mlflow.db
+# then open http://127.0.0.1:5000
+```
+
+Each run carries the design **params** (architecture, classes, epochs…), the
+reported **metrics** (accuracy / mAP / counting rates), and a **description**
+summarizing what changed and why. Milestones logged:
+
+| Version | Date | Change | Native metric | Headline score |
+|---|---|---|---|---|
+| v1.0 | 2026-03-07 | CurrencyMobileNet classification baseline | 94.14% test acc | 0.557 |
+| v2.0 | 2026-05-02 | Switch to YOLOv8 multi-note detection | mAP50 0.982 | 0.663 |
+| v2.1 | 2026-05-21 | Synthetic-data fine-tune (counting fix) | count acc 18%→88% | 0.856 |
+| prod-2.0 | 2026-06-18 | Production hardening (validation, logging, registry) | 37 tests | 0.931 |
+| v2.2 | 2026-06-18 | Visual explainability (Eigen-CAM / Grad-CAM) | 53 tests | 0.956 |
+
+**`headline_score`** is one normalized 0–1 line comparable across the
+classification→detection switch (where raw accuracy and mAP aren't). It blends
+three logged pillars — `0.40·model_quality + 0.35·task_capability +
+0.25·production_readiness` — so you can chart the single trend or its breakdown
+in the UI. Weights and per-pillar values are defined transparently in
+`src/mlflow_history.py`.
+
+### New commands
+
+```powershell
+# Run the full test suite
+pytest tests/ -v
+
+# Register a trained model
+python -c "from src.model_registry import ModelRegistry; ModelRegistry.register_model('outputs/runs/train_finetune/weights/best.pt', {'mAP50': 0.995, 'mAP50_95': 0.989, 'precision': 0.991, 'recall': 0.964}, notes='Original training run')"
+
+# List registered models
+python -c "from src.model_registry import ModelRegistry; ModelRegistry.list_models()"
+
+# Tail structured logs (requires jq)
+Get-Content outputs/logs/detection_*.jsonl -Wait | ForEach-Object { $_ | jq }
+```
+
+### Updated JSON output (excerpt)
+
+```json
+{
+  "schema_version": "2.0",
+  "metadata": {
+    "timestamp": "2026-06-18T14:32:00.123",
+    "image": "test.jpg",
+    "model_version": "outputs/runs/train_finetune/weights/best.pt",
+    "inference_time_ms": 27.3,
+    "image_size": [1920, 1080]
+  },
+  "detections": [
+    {"id": 0, "class": "100_EGP", "confidence": 0.94, "risk": "low",
+     "bbox": [100,150,250,350], "bbox_normalized": [0.052,0.139,0.130,0.324],
+     "area_pixels": 20000}
+  ],
+  "summary": {
+    "num_detections": 1, "counts": {"100_EGP": 1}, "total_egp": 100,
+    "confidence": {"min": 0.94, "max": 0.94, "mean": 0.94, "std": 0.0},
+    "high_risk_count": 0
+  },
+  "counts": {"100_EGP": 1},
+  "total": 100,
+  "confidence_report": { "...": "..." }
+}
+```
+
+## Why YOLOv8 (and not the previous classifier)?
+
+The previous project (`legacy/`) was a single-image classifier — it could
+only output one label for the whole frame. That makes counting multiple notes
+in one photo impossible without bolting on a fragile region-proposal step.
+YOLOv8 detects and classifies every note in one pass, handles overlap, gives
+us bounding boxes for free, and is evaluated with proper detection metrics
+(mAP, P/R) instead of just classification accuracy.

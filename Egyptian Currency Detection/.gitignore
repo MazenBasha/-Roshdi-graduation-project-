@@ -1,10 +1,32 @@
-# Dataset (too large for GitHub)
+# Datasets (too large for GitHub)
 data/
+data_yolo/
+data_synth/
 
-# Model outputs (large binary files)
+# Training-run noise — keep only weights + the registry
 outputs/checkpoints/
 outputs/model.ptl
 outputs/test_predictions.png
+outputs/detections/
+outputs/logs/
+outputs/runs/*/labels/
+outputs/runs/*/*.png
+outputs/runs/*/*.jpg
+outputs/runs/*/*.yaml
+outputs/runs/*/*.csv
+outputs/runs/*/events.out.tfevents.*
+outputs/runs/eval/
+
+# Pretrained model fetched during training
+yolov8n.pt
+
+# MLflow store — regenerate with `python src/mlflow_history.py`
+mlflow.db
+mlruns/
+mlartifacts/
+
+# Claude Code local cache
+.claude/
 
 # Python
 __pycache__/
@@ -14,6 +36,8 @@ __pycache__/
 dist/
 build/
 .eggs/
+.venv/
+venv/
 
 # IDE
 .vscode/

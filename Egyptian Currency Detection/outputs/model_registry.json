@@ -1,0 +1,24 @@
+[
+  {
+    "active": true,
+    "timestamp": "2026-06-18T00:49:52.745348",
+    "path": "outputs/runs/train_finetune/weights/best.pt",
+    "size_mb": 5.929,
+    "mAP50": 0.995,
+    "mAP50_95": 0.989,
+    "precision": 0.991,
+    "recall": 0.964,
+    "notes": "Original fine-tune"
+  },
+  {
+    "active": false,
+    "timestamp": "2026-06-18T00:49:52.753348",
+    "path": "outputs/runs/train2/weights/best.pt",
+    "size_mb": 5.919,
+    "mAP50": 0.982,
+    "mAP50_95": 0.971,
+    "precision": 0.978,
+    "recall": 0.955,
+    "notes": "Earlier baseline"
+  }
+]
