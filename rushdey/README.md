@@ -55,7 +55,7 @@ assets/tessdata/ara.traineddata
 ```
 
 ## Build
-
+ 
 ```powershell
 flutter pub get
 flutter build apk --debug
