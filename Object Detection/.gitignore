@@ -1,0 +1,19 @@
+.env
+datasets/
+runs/
+results/
+
+# Ship the pretrained checkpoint with the module; ignore other .pt files
+# (e.g. user-trained best.pt from runs/).
+*.pt
+!yolo11n.pt
+
+*.onnx
+*.tflite
+*.mlpackage/
+*.mlmodel
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/
+.DS_Store

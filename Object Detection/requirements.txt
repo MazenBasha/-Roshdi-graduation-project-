@@ -1,0 +1,29 @@
+# --- Production runtime (everything needed to serve detections) ---
+ultralytics>=8.3.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+python-multipart>=0.0.9
+prometheus-client>=0.20.0
+pillow>=10.2.0
+python-dotenv>=1.0.0
+opencv-python>=4.9.0          # webcam_demo.py
+
+# --- Mobile export targets ---
+onnx>=1.15.0
+onnxruntime>=1.17.0
+onnxslim>=0.1.34
+# tensorflow / coremltools are heavy and only needed for TFLite / CoreML export.
+# They're commented out so a default `pip install -r requirements.txt` stays
+# fast and slim. Uncomment if you'll run `make export`.
+# tensorflow>=2.16.0
+# coremltools>=7.2
+
+# --- Optional: fine-tuning only ---
+# Required only for download_dataset.py / train.py. Uncomment to enable.
+# roboflow>=1.1.0
+
+# --- Testing ---
+pytest>=8.0.0
+httpx>=0.27.0
