@@ -76,15 +76,19 @@ Roshdi graduation project/
 Wake Word ("رشدي") Detected
         │
         ▼
-Voice Command Processing
+Voice Command Processing (Vosk)
         │
         ├──→ Face Recognition
         │    │
         │    └──→ Identify person in camera
         │
-        └──→ Currency Detection
+        ├──→ Currency Detection
+        │    │
+        │    └──→ Detect, count & sum banknotes
+        │
+        └──→ Obstacle Detection
              │
-             └──→ Detect, count & sum banknotes
+             └──→ Real-time visual-proximity warnings
 ```
 
 The wake word activates the assistant, after which the requested model runs on-device and results are returned as audio feedback.
@@ -279,15 +283,22 @@ For full details, see [Voice commands/README.md](Voice%20commands/README.md).
 
 **Location:** `rushdey/`
 
-The cross-platform Flutter application that unifies all three modules and runs them **offline, on-device**. Built with the `pytorch_lite` plugin, it bundles the exported models as assets:
+The cross-platform Flutter application that unifies all modules and runs them **offline, on-device**. The app relies heavily on **custom native Android (Kotlin) ML engines** directly calling PyTorch Mobile and TensorFlow Lite to ensure optimal performance and avoid Flutter-plugin tensor issues.
 
 | Asset | Module |
 |-------|--------|
 | `assets/models/wake_word_trial2.ptl` + `config.json` | Voice Commands |
 | `assets/models/face_model.tflite` | Face Recognition |
 | `assets/models/currency_model.ptl` / `best.ptl` + `labels.txt` | Currency Detection |
+| `assets/models/object_detector.ptl` | Obstacle Detection |
 
-**Stack:** Flutter (Dart SDK ^3.11.1), `pytorch_lite ^4.3.2`, `image`, `shared_preferences`. Targets **Android, iOS, web, Windows, macOS, and Linux**.
+**Key Native Kotlin Engines:**
+- **`WakeWordDetector` / `VoskIntentEngine`**: Robust fuzzy matching for the wake word and Vosk Arabic ASR for offline intent routing.
+- **`CurrencyEngine`**: Native PyTorch Mobile implementation handling both YOLOv8 boxes and classifier logits.
+- **`ObjectDetectionEngine`**: YOLO-based real-time obstacle detection engine providing distance hints.
+- **`FaceEngine`**: TFLite-based embedding extractor and matcher.
+
+**Stack:** Flutter (Dart SDK ^3.11.1), Kotlin, PyTorch Mobile, TensorFlow Lite, Vosk. Targets **Android** primarily for native ML engines, with Flutter UI.
 
 ### Build & Run
 
@@ -341,12 +352,14 @@ pip install -r "Egyptian Currency Detection/requirements.txt"
 
 The Roshdi app brings the three modules together into a unified assistant that:
 
-- ✓ Listens for the wake word (*"رشدي"*)
+- ✓ Listens for the wake word (*"رشدي"*) via fuzzy matching
+- ✓ Processes voice commands locally via Vosk Arabic ASR
 - ✓ Identifies people via face recognition
 - ✓ Detects, counts, and sums Egyptian banknotes
+- ✓ Provides real-time obstacle detection and walking assistance
 - ✓ Responds to voice queries with audio feedback
 
-Enabling visually impaired users to identify who they're talking to, determine the value of banknotes they're holding, and control the device entirely by voice.
+Enabling visually impaired users to identify who they're talking to, determine the value of banknotes they're holding, navigate around obstacles, and control the device entirely by voice.
 
 ---
 

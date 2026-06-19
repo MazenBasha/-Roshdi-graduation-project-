@@ -17,6 +17,8 @@ TEST_CASES = [
     ("معايا كام فلوس", "currency_count"),
     ("اقرأ المكتوب", "ocr_read_text"),
     ("النص مكتوب ايه", "ocr_read_text"),
+    ("ايه اللي قدامي", "object_obstacle_detection"),
+    ("فيه عائق قدامي", "object_obstacle_detection"),
     ("الجو جميل", "unknown"),
     ("", "none"),
 ]

@@ -26,17 +26,23 @@ void main() {
         .setMockMethodCallHandler(modelsChannel, null);
   });
 
-  testWidgets('Rushdey opens and navigates to commands', (tester) async {
-    await tester.pumpWidget(const RushdieApp());
+  testWidgets('Rushdey opens with commands, people, and settings', (
+    tester,
+  ) async {
+    await tester.pumpWidget(const RushdeyApp());
     await tester.pumpAndSettle();
 
-    expect(find.text('وضع الأمان'), findsOneWidget);
-    expect(find.text('أوامر'), findsOneWidget);
-
-    await tester.tap(find.text('أوامر'));
-    await tester.pumpAndSettle();
-
+    expect(find.text('رشدي'), findsOneWidget);
     expect(find.text('الأوامر'), findsOneWidget);
-    expect(find.text('ابدأ الاستماع'), findsOneWidget);
+    expect(find.text('الأشخاص'), findsOneWidget);
+    expect(find.text('الإعدادات'), findsOneWidget);
+    expect(find.text('أمان'), findsNothing);
+    expect(find.text('ابدأ'), findsOneWidget);
+
+    await tester.tap(find.text('الأشخاص'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('الأشخاص المسجلون'), findsOneWidget);
+    expect(find.text('لا يوجد أشخاص بعد'), findsOneWidget);
   });
 }

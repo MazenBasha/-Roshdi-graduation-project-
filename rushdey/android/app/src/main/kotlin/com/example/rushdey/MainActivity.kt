@@ -15,8 +15,10 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.provider.Settings
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.speech.tts.Voice
 import android.util.Log
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
@@ -66,6 +68,7 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
     private lateinit var faceEngine: FaceEngine
     private lateinit var currencyEngine: CurrencyEngine
     private lateinit var ocrEngine: OCREngine
+    private lateinit var objectDetectionEngine: ObjectDetectionEngine
     private var voskEngine: VoskIntentEngine? = null
     private var voskReady = false
     private var voskInitializing = false
@@ -73,10 +76,13 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
     private var faceReady = false
     private var currencyReady = false
     private var ocrReady = false
+    private var objectDetectionReady = false
+    private var useYoloCurrencyModel = false
 
     // TTS
     private var tts: TextToSpeech? = null
     private var ttsReady = false
+    private var preferredTtsVoiceName: String? = null
     private val ttsEnginePackage = "com.google.android.tts"
     private var audioManager: AudioManager? = null
     private var audioFocusRequest: AudioFocusRequest? = null
@@ -91,6 +97,12 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
     private var lastPreviewJpegBytes: ByteArray? = null
     private var lastPreviewFrameAt: Long = 0L
     private val previewFrameIntervalMs = 220L
+    private var objectDetectionActive: Boolean = false
+    private var objectDetectionInProgress: Boolean = false
+    private var lastObjectDetectionAt: Long = 0L
+    private val objectDetectionIntervalMs = 260L
+    private var cameraInitInProgress: Boolean = false
+    private var cameraRebindRequested: Boolean = false
     private val cameraExecutor = Executors.newSingleThreadExecutor()
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -141,14 +153,23 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
                     "stopIntentListening"   -> handleStopIntentListening(result)
                     "setCameraConfig"       -> handleSetCameraConfig(call.arguments, result)
                     "getCameraConfig"       -> handleGetCameraConfig(result)
+                    "setCurrencyModelMode"  -> handleSetCurrencyModelMode(call.arguments, result)
+                    "getCurrencyModelMode"  -> handleGetCurrencyModelMode(result)
                     "startCameraPreview"    -> handleStartCameraPreview(result)
                     "stopCameraPreview"     -> handleStopCameraPreview(result)
+                    "startObjectDetection"  -> handleStartObjectDetection(result)
+                    "stopObjectDetection"   -> handleStopObjectDetection(result)
                     "captureAndRecognizeFace"     -> handleCaptureFace(result)
                     "captureAndDetectCurrency"    -> handleCaptureCurrency(result)
                     "captureAndReadText"          -> handleCaptureOCR(result)
                     "enrollPerson"          -> handleEnrollPerson(call.arguments, result)
                     "deleteEnrolledPerson"  -> handleDeletePerson(call.arguments, result)
                     "listEnrolledPersons"   -> handleListPersons(result)
+                    "listTtsVoices"         -> handleListTtsVoices(result)
+                    "setTtsVoice"           -> handleSetTtsVoice(call.arguments, result)
+                    "getTtsVoice"           -> handleGetTtsVoice(result)
+                    "openTtsSettings"       -> handleOpenTtsSettings(result)
+                    "openTtsInstallData"    -> handleOpenTtsInstallData(result)
                     "speakText"             -> { speak(call.arguments as? String ?: ""); result.success(null) }
                     else -> result.notImplemented()
                 }
@@ -179,10 +200,24 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun initCamera() {
+        if (isFinishing || isDestroyed) return
+        if (cameraInitInProgress) {
+            cameraRebindRequested = true
+            return
+        }
+        cameraInitInProgress = true
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             try {
                 val cameraProvider = cameraProviderFuture.get()
+                val previousAnalysis = imageAnalysis
+                if (!cameraPreviewActive && pendingCameraIntent.isBlank()) {
+                    previousAnalysis?.clearAnalyzer()
+                    cameraProvider.unbindAll()
+                    imageCapture = null
+                    imageAnalysis = null
+                    return@addListener
+                }
                 imageCapture = ImageCapture.Builder()
                     .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                     .build()
@@ -201,6 +236,7 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
                 val cameraSelector = CameraSelector.Builder()
                     .requireLensFacing(cameraLensFacing)
                     .build()
+                previousAnalysis?.clearAnalyzer()
                 cameraProvider.unbindAll()
                 val capture = imageCapture
                 val analysis = imageAnalysis
@@ -211,6 +247,12 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "CameraX init failed", e)
+            } finally {
+                cameraInitInProgress = false
+                if (cameraRebindRequested) {
+                    cameraRebindRequested = false
+                    initCamera()
+                }
             }
         }, ContextCompat.getMainExecutor(this))
     }
@@ -221,25 +263,11 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
         if (status == TextToSpeech.SUCCESS) {
             val locale = Locale("ar", "EG")
             
-            // Prefer stable offline voice for Egyptian Arabic
-            val voices = tts?.voices
-            val bestVoice = voices?.find {
-                it.locale.language == "ar" &&
-                (it.locale.country == "EG" || it.name.contains("eg", ignoreCase = true)) &&
-                !it.isNetworkConnectionRequired
-            } ?: voices?.find {
-                it.locale.language == "ar" && !it.isNetworkConnectionRequired
-            } ?: voices?.find { it.locale.language == "ar" }
-
-            if (bestVoice != null) {
-                tts?.voice = bestVoice
-                Log.i(TAG, "Selected offline voice: ${bestVoice.name}")
-            } else {
-                tts?.setLanguage(locale)
-            }
+            applyPreferredTtsVoice()
             
             ttsReady = true
-            tts?.setPitch(1.0f)
+            // A slightly lower pitch helps avoid a feminine-sounding fallback voice.
+            tts?.setPitch(0.82f)
             tts?.setSpeechRate(0.98f)
             tts?.setAudioAttributes(
                 AudioAttributes.Builder()
@@ -255,6 +283,150 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
             
             Log.i(TAG, "TTS init: ready=$ttsReady")
         }
+    }
+
+    private fun selectPreferredArabicMaleVoice(voices: Set<Voice>?): Voice? {
+        val arabicVoices = voices.orEmpty()
+            .filter { it.locale.language.equals("ar", ignoreCase = true) }
+        if (arabicVoices.isEmpty()) return null
+
+        val maleVoices = arabicVoices.filter { isLikelyMaleVoice(it.name) }
+
+        return maleVoices.find { isEgyptianArabicVoice(it) && !it.isNetworkConnectionRequired }
+            ?: maleVoices.find { !it.isNetworkConnectionRequired }
+            ?: maleVoices.find { isEgyptianArabicVoice(it) }
+            ?: maleVoices.firstOrNull()
+            ?: arabicVoices.find { isEgyptianArabicVoice(it) && !it.isNetworkConnectionRequired }
+            ?: arabicVoices.find { !it.isNetworkConnectionRequired }
+            ?: arabicVoices.find { isEgyptianArabicVoice(it) }
+            ?: arabicVoices.firstOrNull()
+    }
+
+    private fun isEgyptianArabicVoice(voice: Voice): Boolean {
+        val name = voice.name.lowercase(Locale.ROOT)
+        return voice.locale.country.equals("EG", ignoreCase = true) ||
+            name.contains("eg") ||
+            name.contains("egypt") ||
+            name.contains("arz")
+    }
+
+    private fun isLikelyMaleVoice(name: String): Boolean {
+        val n = name.lowercase(Locale.ROOT)
+        return listOf(
+            "male",
+            "man",
+            "masculine",
+            "m1",
+            "m2",
+            "m3",
+            "ar-xa-x-arm",
+            "ar-xa-x-arc",
+            "ar-xa-x-ard"
+        ).any { n.contains(it) }
+    }
+
+    private fun applyPreferredTtsVoice(): Voice? {
+        val locale = Locale("ar", "EG")
+        val voices = tts?.voices.orEmpty()
+        val preferred = preferredTtsVoiceName
+            ?.let { voiceName -> voices.firstOrNull { it.name == voiceName } }
+        val selected = preferred ?: selectPreferredArabicMaleVoice(voices)
+
+        if (selected != null) {
+            tts?.voice = selected
+            Log.i(TAG, "Selected Arabic TTS voice: ${selected.name}")
+        } else {
+            tts?.setLanguage(locale)
+            Log.w(TAG, "No Arabic TTS voice found; falling back to locale $locale")
+        }
+
+        return selected
+    }
+
+    private fun handleListTtsVoices(result: MethodChannel.Result) {
+        val voices = tts?.voices.orEmpty()
+            .sortedWith(compareByDescending<Voice> { it.locale.language.equals("ar", ignoreCase = true) }
+                .thenByDescending { isEgyptianArabicVoice(it) }
+                .thenByDescending { isLikelyMaleVoice(it.name) }
+                .thenBy { it.isNetworkConnectionRequired }
+                .thenBy { it.locale.toLanguageTag() }
+                .thenBy { it.name })
+            .map { voiceToMap(it) }
+
+        result.success(mapOf(
+            "ttsReady" to ttsReady,
+            "preferredVoiceName" to preferredTtsVoiceName,
+            "selectedVoiceName" to tts?.voice?.name,
+            "voices" to voices
+        ))
+    }
+
+    private fun handleSetTtsVoice(args: Any?, result: MethodChannel.Result) {
+        val map = args as? Map<*, *>
+        val voiceName = (map?.get("voiceName") as? String)
+            ?: (map?.get("name") as? String)
+        preferredTtsVoiceName = voiceName?.takeIf { it.isNotBlank() }
+        val selected = if (ttsReady) applyPreferredTtsVoice() else null
+
+        result.success(mapOf(
+            "ttsReady" to ttsReady,
+            "preferredVoiceName" to preferredTtsVoiceName,
+            "selectedVoice" to selected?.let { voiceToMap(it) }
+        ))
+    }
+
+    private fun handleGetTtsVoice(result: MethodChannel.Result) {
+        result.success(mapOf(
+            "ttsReady" to ttsReady,
+            "preferredVoiceName" to preferredTtsVoiceName,
+            "selectedVoice" to tts?.voice?.let { voiceToMap(it) }
+        ))
+    }
+
+    private fun handleOpenTtsSettings(result: MethodChannel.Result) {
+        openTtsIntent(Intent(ACTION_TEXT_TO_SPEECH_SETTINGS), result)
+    }
+
+    private fun handleOpenTtsInstallData(result: MethodChannel.Result) {
+        try {
+            startActivity(Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            result.success(true)
+        } catch (e: Exception) {
+            Log.w(TAG, "TTS install data screen unavailable; opening TTS settings", e)
+            openTtsIntent(Intent(ACTION_TEXT_TO_SPEECH_SETTINGS), result)
+        }
+    }
+
+    private fun openTtsIntent(intent: Intent, result: MethodChannel.Result) {
+        try {
+            startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            result.success(true)
+        } catch (e: Exception) {
+            try {
+                startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                result.success(true)
+            } catch (fallback: Exception) {
+                Log.e(TAG, "Failed to open TTS screen", fallback)
+                result.error("TTS_SETTINGS_UNAVAILABLE", fallback.message ?: "TTS settings unavailable", null)
+            }
+        }
+    }
+
+    private fun voiceToMap(voice: Voice): Map<String, Any?> {
+        return mapOf(
+            "name" to voice.name,
+            "locale" to voice.locale.toLanguageTag(),
+            "language" to voice.locale.language,
+            "country" to voice.locale.country,
+            "displayLocale" to voice.locale.getDisplayName(Locale("ar", "EG")),
+            "isArabic" to voice.locale.language.equals("ar", ignoreCase = true),
+            "isEgyptian" to isEgyptianArabicVoice(voice),
+            "isLikelyMale" to isLikelyMaleVoice(voice.name),
+            "isNetworkRequired" to voice.isNetworkConnectionRequired,
+            "quality" to voice.quality,
+            "latency" to voice.latency,
+            "features" to voice.features.orEmpty().toList().sorted()
+        )
     }
 
     private var lastSpokenText: String? = null
@@ -326,12 +498,17 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
             ocrReady = ocrEngine.initialize()
             Log.i(TAG, "OCREngine ready: $ocrReady")
 
+            objectDetectionEngine = ObjectDetectionEngine(this@MainActivity)
+            objectDetectionReady = objectDetectionEngine.initialize()
+            Log.i(TAG, "ObjectDetectionEngine ready: $objectDetectionReady")
+
             withContext(Dispatchers.Main) {
                 sendModelEvent(mapOf(
                     "type" to "engines_ready",
                     "face" to faceReady,
                     "currency" to currencyReady,
-                    "ocr" to ocrReady
+                    "ocr" to ocrReady,
+                    "objectDetection" to objectDetectionReady
                 ))
             }
         }
@@ -339,7 +516,12 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
 
     private fun handleInitModels(result: MethodChannel.Result) {
         ensureVoskInitialized(startAfterReady = false)
-        result.success(mapOf("face" to faceReady, "currency" to currencyReady, "ocr" to ocrReady))
+        result.success(mapOf(
+            "face" to faceReady,
+            "currency" to currencyReady,
+            "ocr" to ocrReady,
+            "objectDetection" to objectDetectionReady
+        ))
     }
 
     // ─────────────────────── Intent Listening ────────────────────────────────
@@ -418,6 +600,32 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
 
     // ─────────────────────── Camera + Inference ───────────────────────────────
 
+    private fun handleSetCurrencyModelMode(args: Any?, result: MethodChannel.Result) {
+        val map = args as? Map<*, *>
+        val mode = (map?.get("mode") as? String)?.lowercase()
+        val useYolo = map?.get("useYolo") as? Boolean
+        useYoloCurrencyModel = useYolo ?: (mode == "yolo_v8" || mode == "yolov8" || mode == "yolo")
+
+        Log.i(TAG, "Currency model mode set to ${currencyModelModeName()}")
+        result.success(mapOf("mode" to currencyModelModeName()))
+    }
+
+    private fun handleGetCurrencyModelMode(result: MethodChannel.Result) {
+        result.success(mapOf("mode" to currencyModelModeName()))
+    }
+
+    private fun selectedCurrencyMode(): CurrencyEngine.Mode {
+        return if (useYoloCurrencyModel) CurrencyEngine.Mode.YOLO_V8 else CurrencyEngine.Mode.CLASSIC
+    }
+
+    private fun currencyModelModeName(): String {
+        return if (useYoloCurrencyModel) "yolo_v8" else "classic"
+    }
+
+    private fun currencyModelModeName(mode: CurrencyEngine.Mode): String {
+        return if (mode == CurrencyEngine.Mode.YOLO_V8) "yolo_v8" else "classic"
+    }
+
     private fun handleStartCameraPreview(result: MethodChannel.Result) {
         if (!hasCameraPermission()) {
             requestCameraPermission(result, "preview")
@@ -441,6 +649,8 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun handleStopCameraPreview(result: MethodChannel.Result) {
+        objectDetectionActive = false
+        objectDetectionInProgress = false
         cameraPreviewActive = false
         cameraPreviewFrozen = false
         if (pendingCameraIntent.isBlank()) {
@@ -449,9 +659,64 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
         result.success(true)
     }
 
+    private fun handleStartObjectDetection(result: MethodChannel.Result) {
+        if (!hasCameraPermission()) {
+            requestCameraPermission(result, "object_live")
+            return
+        }
+        startLiveObjectDetection()
+        result.success(mapOf("active" to objectDetectionActive, "ready" to objectDetectionReady))
+    }
+
+    private fun handleStopObjectDetection(result: MethodChannel.Result) {
+        stopLiveObjectDetection(speakStop = true)
+        result.success(true)
+    }
+
+    private fun startLiveObjectDetection() {
+        if (!objectDetectionReady || !::objectDetectionEngine.isInitialized) {
+            objectDetectionActive = false
+            val msg = "نموذج كشف العوائق غير جاهز"
+            sendModelEvent(mapOf(
+                "type" to "object_detection_status",
+                "active" to false,
+                "ready" to false,
+                "message" to msg
+            ))
+            speak(msg)
+            return
+        }
+
+        objectDetectionActive = true
+        objectDetectionInProgress = false
+        lastObjectDetectionAt = 0L
+        startPreviewStream()
+        val msg = "تم تشغيل تحذير العوائق"
+        sendModelEvent(mapOf(
+            "type" to "object_detection_status",
+            "active" to true,
+            "ready" to true,
+            "message" to msg
+        ))
+        speak(msg)
+    }
+
+    private fun stopLiveObjectDetection(speakStop: Boolean = false) {
+        val wasActive = objectDetectionActive
+        objectDetectionActive = false
+        objectDetectionInProgress = false
+        sendModelEvent(mapOf(
+            "type" to "object_detection_status",
+            "active" to false,
+            "ready" to objectDetectionReady,
+            "message" to "تم إيقاف تحذير العوائق"
+        ))
+        if (speakStop && wasActive) speak("تم إيقاف تحذير العوائق")
+    }
+
     private fun handlePreviewFrame(image: ImageProxy) {
         try {
-            if (!cameraPreviewActive || cameraPreviewFrozen || modelEventSink == null) return
+            if (!cameraPreviewActive || cameraPreviewFrozen) return
             val now = System.currentTimeMillis()
             if (now - lastPreviewFrameAt < previewFrameIntervalMs) return
             lastPreviewFrameAt = now
@@ -461,11 +726,58 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
                 "type" to "camera_preview",
                 "imageBytes" to bytes
             ))
+            maybeRunObjectDetection(bytes, now)
         } catch (e: Exception) {
             Log.w(TAG, "Preview frame failed", e)
         } finally {
             image.close()
         }
+    }
+
+    private fun maybeRunObjectDetection(frameBytes: ByteArray, now: Long) {
+        if (!objectDetectionActive || !objectDetectionReady || !::objectDetectionEngine.isInitialized) return
+        if (objectDetectionInProgress) return
+        if (now - lastObjectDetectionAt < objectDetectionIntervalMs) return
+
+        lastObjectDetectionAt = now
+        objectDetectionInProgress = true
+        val bytesForInference = frameBytes.copyOf()
+
+        CoroutineScope(Dispatchers.IO).launch {
+            val detectionResult = objectDetectionEngine.detect(bytesForInference, now)
+            withContext(Dispatchers.Main) {
+                objectDetectionInProgress = false
+                if (!objectDetectionActive) return@withContext
+
+                val message = detectionResult.messageAr
+                sendModelEvent(mapOf(
+                    "type" to "object_detection_result",
+                    "active" to true,
+                    "ready" to detectionResult.ready,
+                    "shouldSpeak" to detectionResult.shouldSpeak,
+                    "messageAr" to message,
+                    "messageEn" to detectionResult.messageEn,
+                    "mainObject" to detectionResult.mainObject?.let { objectDetectionToMap(it) },
+                    "detections" to detectionResult.allDetections.map { objectDetectionToMap(it) }
+                ))
+
+                if (detectionResult.shouldSpeak && message.isNotBlank()) {
+                    speak(message)
+                }
+            }
+        }
+    }
+
+    private fun objectDetectionToMap(det: ObjectDetectionEngine.AnalyzedDetection): Map<String, Any> {
+        return mapOf(
+            "className" to det.className,
+            "confidence" to det.confidence,
+            "distanceHint" to det.distanceHint,
+            "horizontalPosition" to det.horizontalPosition,
+            "areaRatio" to det.areaRatio,
+            "heightRatio" to det.heightRatio,
+            "bbox" to det.box.map { it.toDouble() }
+        )
     }
 
     private fun handleCaptureFace(result: MethodChannel.Result) {
@@ -572,6 +884,7 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
     private fun shutdownCamera() {
         try {
             val cameraProvider = ProcessCameraProvider.getInstance(this).get()
+            imageAnalysis?.clearAnalyzer()
             cameraProvider.unbindAll()
         } catch (e: Exception) {
             Log.w(TAG, "Failed to shutdown camera", e)
@@ -579,6 +892,8 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
             imageCapture = null
             imageAnalysis = null
             cameraCaptureInProgress = false
+            cameraInitInProgress = false
+            cameraRebindRequested = false
         }
     }
 
@@ -710,8 +1025,10 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
         pendingCameraIntent = ""
 
         CoroutineScope(Dispatchers.IO).launch {
+            val currencyMode = selectedCurrencyMode()
+            val currencyModeName = currencyModelModeName(currencyMode)
             val currResult = if (currencyReady) {
-                currencyEngine.detect(imageBytes)
+                currencyEngine.detect(imageBytes, currencyMode)
             } else {
                 CurrencyEngine.CurrencyResult(emptyList(), 0, "\u0645\u062d\u0631\u0643 \u0627\u0644\u0639\u0645\u0644\u0629 \u063a\u064a\u0631 \u062c\u0627\u0647\u0632")
             }
@@ -723,12 +1040,14 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
                     "arabicName" to currResult.arabicName,
                     "total"      to currResult.total,
                     "ttsText"    to currResult.arabicName,
+                    "model"      to currencyModeName,
                     "imageBytes" to imageBytes
                 ))
                 result?.success(mapOf(
                     "arabicName" to currResult.arabicName,
                     "total"      to currResult.total,
-                    "ttsText"    to currResult.arabicName
+                    "ttsText"    to currResult.arabicName,
+                    "model"      to currencyModeName
                 ))
                 releaseCameraFreeze()
             }
@@ -1056,6 +1375,13 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
                         pendingCameraIntent == "face"     -> launchCamera()
                         pendingCameraIntent == "currency" -> launchCamera()
                         pendingCameraIntent == "ocr"      -> launchCamera()
+                        pendingCameraIntent == "object_live" -> {
+                            pendingCameraIntent = ""
+                            val result = pendingCameraResult
+                            pendingCameraResult = null
+                            startLiveObjectDetection()
+                            result?.success(mapOf("active" to objectDetectionActive, "ready" to objectDetectionReady))
+                        }
                         pendingCameraIntent.startsWith("enroll:") -> {
                             pendingEnrollName = pendingCameraIntent.substringAfter("enroll:")
                             enrollEmbeddings.clear()
@@ -1068,6 +1394,7 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
                     }
                 } else {
                     val result = pendingCameraResult; pendingCameraResult = null
+                    pendingCameraIntent = ""
                     result?.error("CAMERA_PERMISSION_DENIED", "Camera permission denied", null)
                 }
             }
@@ -1099,22 +1426,31 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
 
     // ─────────────────────── Helpers ─────────────────────────────────────────
 
-    private fun sendModelEvent(event: Map<String, Any>) {
-        mainHandler.post { modelEventSink?.success(event) }
+    private fun sendModelEvent(event: Map<String, Any?>) {
+        mainHandler.post {
+            try {
+                modelEventSink?.success(event)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to send model event ${event["type"]}", e)
+            }
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        objectDetectionActive = false
         tts?.shutdown()
         if (::faceEngine.isInitialized) faceEngine.release()
         if (::currencyEngine.isInitialized) currencyEngine.release()
         if (::ocrEngine.isInitialized) ocrEngine.release()
+        if (::objectDetectionEngine.isInitialized) objectDetectionEngine.release()
         voskEngine?.release()
         cameraExecutor.shutdown()
     }
 
     companion object {
         private const val TAG = "MainActivity"
+        private const val ACTION_TEXT_TO_SPEECH_SETTINGS = "com.android.settings.TTS_SETTINGS"
         private const val REQUEST_RECORD_AUDIO      = 1101
         private const val REQUEST_CAMERA            = 1102
         private const val REQUEST_CAMERA_PERMISSION = 1103
