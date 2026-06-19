@@ -279,7 +279,73 @@ For full details, see [Voice commands/README.md](Voice%20commands/README.md).
 
 ---
 
-## 4. Roshdi Mobile App (Flutter)
+## 4. Object Detection Module
+
+**Location:** `Object Detection/`
+
+### Purpose
+
+Real-time **obstacle / proximity detection** that helps visually impaired users navigate around nearby objects. It turns YOLO detections into **voice-friendly proximity warnings** (English + Arabic). It does **not** estimate distance in meters — it estimates *visual proximity* from the normalized bounding-box size inside the camera frame.
+
+### Architecture
+
+Built on **YOLO11n (Ultralytics)** pretrained on the **Microsoft COCO** 80-class dataset. Each detection is enriched with a `horizontal_position` (left / center / right) and a `distance_hint` (far / near / very_near), then passed through smoothing and cooldown logic before a warning is spoken.
+
+| Attribute | Value |
+|-----------|-------|
+| Framework | Ultralytics YOLO11n |
+| Classes | 80 (COCO) |
+| Processing rate | 5 FPS (configurable) |
+| Proximity metric | normalized bbox `area_ratio` + `height_ratio` |
+| Position | left / center / right (frame thirds) |
+| Output | English + Arabic warning messages, structured JSON |
+| Speech | optional `pyttsx3` text-to-speech (en / ar) |
+
+### Proximity Logic
+
+Instead of one global threshold, objects are grouped so a car, a chair, and a bottle are each judged by size-appropriate thresholds:
+
+- **Large danger:** person, car, bus, truck, motorcycle, bicycle
+- **Medium obstacle:** chair, bench, couch, dining table, suitcase, backpack
+- **Small object:** bottle, cup, cell phone, book, remote, mouse, keyboard
+- **Default:** all other COCO classes
+
+Robustness features: confidence filtering, **temporal smoothing** across the last 3 processed frames (an alert needs ≥ 2 hits), priority selection (very-near and danger classes first), and a **2-second cooldown** to avoid repeating the same warning.
+
+### Pipeline
+
+```
+Live Camera / Webcam
+        │
+        ▼
+YOLO11n Detector  ──→  per-object boxes + class + confidence
+        │
+        ▼
+Proximity analysis  (area_ratio + height_ratio → far / near / very_near)
+        │
+        ├──→ position (left / center / right) + priority selection
+        ▼
+Smoothing + cooldown  ──→  spoken warning (EN / AR) + structured JSON
+```
+
+### Usage
+
+```bash
+cd "Object Detection"
+pip install -r requirements.txt
+python live_camera_proximity.py                                   # local webcam test
+python live_camera_proximity.py --weights yolo11n.pt --conf 0.40 --process-fps 5
+python live_camera_proximity.py --speak --lang ar                 # spoken Arabic warnings
+python live_camera_proximity.py --print-json                      # structured output
+```
+
+Press `Q` in the camera window to stop.
+
+For full details, see [Object Detection/README_LOCAL_TEST.md](Object%20Detection/README_LOCAL_TEST.md).
+
+---
+
+## 5. Roshdi Mobile App (Flutter)
 
 **Location:** `rushdey/`
 
