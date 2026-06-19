@@ -21,7 +21,7 @@ import java.net.URL
  * After the wake word is detected:
  *  1. Starts Vosk ASR with Arabic model
  *  2. Listens for up to [timeoutMs] ms
- *  3. Detects intent: face_who_is_in_front | currency_count | ocr_read_text | unknown
+ *  3. Detects intent: face_who_is_in_front | currency_count | ocr_read_text | object_obstacle_detection | unknown
  *  4. Sends intent via EventChannel to Flutter
  *
  * The Arabic Vosk model (~50 MB) is downloaded on first run and cached.
@@ -37,13 +37,110 @@ class VoskIntentEngine(
     private val modelUrl = "https://alphacephei.com/vosk/models/vosk-model-ar-mgb2-0.4.zip"
     private val timeoutMs = 8000L
     private var timeoutJob: Job? = null
+    private var pendingPartialIntent: String? = null
+    private var pendingPartialText: String = ""
 
-    // Grammar phrases (matching vosk_vosk.py)
-    private val grammarPhrases = listOf(
-        "مين", "مين ده", "مين دي", "مين قدامي", "من قدامي",
-        "مين امامي", "من امامي", "ده مين", "هذا مين",
-        "مكتوب", "اقرا", "اقرالي", "النص", "المكتوب",
-        "كام", "كم", "دول كام", "دول كم", "عدد", "قد ايه"
+    private val faceUtterances = listOf(
+        "مين ده", "مين دي", "ده مين", "دي مين",
+        "مين اللي قدامي", "مين اللي ادامي", "مين قدامي", "مين ادامي",
+        "من اللي قدامي", "من اللي ادامي", "من قدامي", "من ادامي",
+        "مين واقف قدامي", "مين واقف ادامي",
+        "مين موجود قدامي", "مين موجود ادامي",
+        "في حد قدامي", "في حد ادامي",
+        "الشخص ده مين", "الشخص دي مين",
+        "الراجل ده مين", "الست دي مين", "البنت دي مين", "الولد ده مين",
+        "اللي قدامي ده مين", "اللي ادامي ده مين",
+        "اعرف مين ده", "اعرف مين دي",
+        "عايز اعرف مين ده", "عايز اعرف مين دي",
+        "قولي مين ده", "قولي مين دي",
+        "قول لي مين ده", "قول لي مين دي",
+        "تعرف مين ده", "تعرف مين دي",
+        "هو ده مين", "هي دي مين",
+        "مين الشخص ده", "مين الشخص اللي قدامي",
+        "مين اللي واقف", "مين اللي واقف قدامي",
+        "قدامي مين", "ادامي مين",
+        "شايف مين", "انت شايف مين",
+        "فيه مين قدامي", "فيه مين ادامي"
+    ).distinct()
+
+    private val currencyUtterances = listOf(
+        "دول كام", "دول كم", "دول بكام",
+        "الفلوس دي كام", "الفلوس دي كم",
+        "معايا كام", "معايا كم",
+        "كام جنيه دول", "كم جنيه دول",
+        "المبلغ ده كام", "المبلغ ده كم",
+        "قيمة الفلوس كام", "قيمة الفلوس كم",
+        "دول قيمتهم كام", "دول قيمتهم كم",
+        "احسب الفلوس", "عد الفلوس",
+        "عدهم", "احسبهم",
+        "شوف دول كام", "شوف دول كم",
+        "قولي دول كام", "قولي دول كم",
+        "قول لي المبلغ", "قولي المبلغ",
+        "معايا قد ايه", "معايا اد ايه",
+        "دول قد ايه", "دول اد ايه",
+        "كام ورقة", "كم ورقة",
+        "عدد الفلوس", "عدد الورق",
+        "اعرف معايا كام", "اعرف معايا كم",
+        "الفلوس اللي في ايدي كام",
+        "الفلوس اللي في ايدي كم",
+        "احسبلي الفلوس", "اعدلي الفلوس"
+    ).distinct()
+
+    private val ocrUtterances = listOf(
+        "اقرا", "اقرالي", "اقرا لي",
+        "اقرا المكتوب", "اقرالي المكتوب",
+        "اقرا اللي مكتوب", "اقرالي اللي مكتوب",
+        "مكتوب ايه", "ايه المكتوب",
+        "الكلام ده ايه", "النص ده ايه",
+        "اقرا النص", "اقرالي النص",
+        "اقرا الكلام", "اقرالي الكلام",
+        "قولي مكتوب ايه", "قول لي مكتوب ايه",
+        "قولي الكلام", "قول لي الكلام",
+        "قولي النص", "قول لي النص",
+        "شوف مكتوب ايه", "شوف الكلام ده",
+        "اقرا الورقة", "اقرالي الورقة",
+        "اقرا اللافتة", "اقرالي اللافتة",
+        "اقرا الشاشة", "اقرالي الشاشة",
+        "عايز اعرف مكتوب ايه",
+        "عايز اقرا اللي قدامي",
+        "عايز اقرا اللي ادامي",
+        "الكلام اللي قدامي ايه",
+        "الكلام اللي ادامي ايه",
+        "اقرا ده", "اقرالي ده",
+        "ايه اللي مكتوب هنا",
+        "مكتوب هنا ايه"
+    ).distinct()
+
+    private val objectUtterances = listOf(
+        "ايه اللي قدامي", "ايه الي قدامي", "ايه اللي ادامي", "ايه الي ادامي",
+        "فيه ايه قدامي", "في ايه قدامي", "فيه ايه ادامي", "في ايه ادامي",
+        "فيه ايه امامي", "في ايه امامي",
+        "ايه قدامي", "ايه ادامي", "ايه امامي",
+        "شايف ايه قدامي", "شايف ايه ادامي", "انت شايف ايه قدامي",
+        "في عائق قدامي", "فيه عائق قدامي", "في عائق ادامي", "فيه عائق ادامي",
+        "في حاجه قدامي", "فيه حاجه قدامي", "في حاجة قدامي", "فيه حاجة قدامي",
+        "هل الطريق فاضي", "الطريق فاضي", "الطريق قدامي فاضي",
+        "افتح كشف العوائق", "شغل كشف العوائق", "راقب الطريق",
+        "حذرني من العوائق", "نبهني لو في عائق", "نبهني من العوائق",
+        "خلي بالك من الطريق", "ابدأ تحذير العوائق"
+    ).distinct()
+
+    private val grammarPhrases = (faceUtterances + currencyUtterances + ocrUtterances + objectUtterances).distinct()
+    private val normalizedFaceUtterances = normalizePhrases(faceUtterances)
+    private val normalizedCurrencyUtterances = normalizePhrases(currencyUtterances)
+    private val normalizedOcrUtterances = normalizePhrases(ocrUtterances)
+    private val normalizedObjectUtterances = normalizePhrases(objectUtterances)
+    private val ocrKeywords = normalizePhrases(
+        listOf("اقرا", "اقرالي", "مكتوب", "المكتوب", "النص", "الكلام", "الورقه", "اللافته", "الشاشه")
+    )
+    private val currencyKeywords = normalizePhrases(
+        listOf("فلوس", "جنيه", "مبلغ", "قيمه", "كام", "كم", "عدد", "عد", "احسب", "ورقه", "الورق", "قد ايه", "اد ايه", "بكام")
+    )
+    private val faceKeywords = normalizePhrases(
+        listOf("مين", "من", "شخص", "الشخص", "راجل", "الراجل", "ست", "الست", "بنت", "البنت", "ولد", "الولد", "واقف", "موجود", "حد", "شايف")
+    )
+    private val objectKeywords = normalizePhrases(
+        listOf("عائق", "عوائق", "حاجه", "حاجة", "الطريق", "فاضي", "راقب", "تحذير العوائق", "كشف العوائق", "نبهني", "حذرني")
     )
 
     // ─────────────────────── Init ─────────────────────────────────────────────
@@ -177,6 +274,8 @@ class VoskIntentEngine(
             return
         }
         if (isListening) return
+        pendingPartialIntent = null
+        pendingPartialText = ""
 
         try {
             // Use standard recognizer (runtime graphs not supported by this model)
@@ -191,8 +290,11 @@ class VoskIntentEngine(
                             if (partial.isNotBlank()) {
                                 val intent = detectIntent(partial)
                                 if (intent != "none" && intent != "unknown") {
-                                    // Got a confident early result
-                                    dispatchIntent(intent, partial, isFinal = false)
+                                    pendingPartialIntent = intent
+                                    pendingPartialText = partial
+                                    if (isStrongPartialCommand(partial, intent)) {
+                                        dispatchIntent(intent, partial, isFinal = false)
+                                    }
                                 }
                             }
                         } catch (_: Exception) {}
@@ -220,8 +322,7 @@ class VoskIntentEngine(
                     }
 
                     override fun onTimeout() {
-                        sendEvent(mapOf("type" to "intent_timeout"))
-                        stopListening()
+                        handleIntentTimeout()
                     }
                 })
             }
@@ -233,8 +334,7 @@ class VoskIntentEngine(
             timeoutJob = CoroutineScope(Dispatchers.Main).launch {
                 delay(timeoutMs)
                 if (isListening) {
-                    sendEvent(mapOf("type" to "intent_timeout"))
-                    stopListening()
+                    handleIntentTimeout()
                 }
             }
         } catch (e: Exception) {
@@ -251,6 +351,50 @@ class VoskIntentEngine(
         }
         speechService = null
         isListening = false
+        pendingPartialIntent = null
+        pendingPartialText = ""
+    }
+
+    private fun handleIntentTimeout() {
+        if (!isListening) return
+
+        val intent = pendingPartialIntent
+        val text = pendingPartialText
+        if (isKnownIntent(intent) && text.isNotBlank()) {
+            dispatchIntent(intent!!, text, isFinal = false)
+            return
+        }
+
+        sendEvent(mapOf("type" to "intent_timeout"))
+        stopListening()
+    }
+
+    private fun isKnownIntent(intent: String?): Boolean {
+        return intent == "face_who_is_in_front" ||
+            intent == "currency_count" ||
+            intent == "ocr_read_text" ||
+            intent == "object_obstacle_detection"
+    }
+
+    private fun isStrongPartialCommand(text: String, intent: String): Boolean {
+        val t = normalizeArabic(text)
+        val wordCount = t.split(" ").count { it.isNotBlank() }
+        if (wordCount < 2) return false
+
+        return when (intent) {
+            "ocr_read_text" ->
+                containsAnyPhrase(t, normalizedOcrUtterances) ||
+                    containsAnyPhrase(t, ocrKeywords)
+            "currency_count" ->
+                containsAnyPhrase(t, normalizedCurrencyUtterances) ||
+                    (wordCount >= 3 && containsAnyPhrase(t, currencyKeywords))
+            "face_who_is_in_front" ->
+                containsAnyPhrase(t, normalizedFaceUtterances)
+            "object_obstacle_detection" ->
+                containsAnyPhrase(t, normalizedObjectUtterances) ||
+                    (wordCount >= 3 && containsAnyPhrase(t, objectKeywords))
+            else -> false
+        }
     }
 
     // ─────────────────────── Intent Detection ────────────────────────────────
@@ -262,66 +406,118 @@ class VoskIntentEngine(
         val t = normalizeArabic(text)
         if (t.isBlank()) return "none"
 
-        // OCR: priority first
-        if (t.contains("مكتوب") || t.contains("اقرا") || t.contains("اقرالي") ||
-            t.contains("النص") || t.contains("المكتوب")) {
+        // Direct utterance match, with OCR > currency > face priority.
+        if (containsAnyPhrase(t, normalizedOcrUtterances)) {
             return "ocr_read_text"
         }
-
-        // Currency
-        if (t.contains("كام") || t.contains("كم") || t.contains("عدد") || t.contains("قد ايه")) {
+        if (containsAnyPhrase(t, normalizedCurrencyUtterances)) {
             return "currency_count"
         }
-
-        // Face
-        if (t.contains("مين") || t.contains("من")) {
-            if (t.contains("كام") || t.contains("كم")) return "currency_count"
+        if (containsAnyPhrase(t, normalizedFaceUtterances)) {
             return "face_who_is_in_front"
         }
+        if (containsAnyPhrase(t, normalizedObjectUtterances)) {
+            return "object_obstacle_detection"
+        }
 
-        // Fuzzy fallback
+        // Keyword fallback, keeping the same priority order.
+        if (containsAnyPhrase(t, ocrKeywords)) {
+            return "ocr_read_text"
+        }
+        if (containsAnyPhrase(t, currencyKeywords)) {
+            return "currency_count"
+        }
+        if (containsAnyPhrase(t, faceKeywords)) {
+            return "face_who_is_in_front"
+        }
+        if (containsAnyPhrase(t, objectKeywords)) {
+            return "object_obstacle_detection"
+        }
+
         return fuzzyDetect(t)
     }
 
     private fun normalizeArabic(s: String): String {
         return s.trim()
+            .lowercase()
             .replace(Regex("[^\\u0600-\\u06FF\\s]"), " ")
             .replace(Regex("\\s+"), " ")
             .replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
             .replace("ة", "ه").replace("ى", "ي")
             .replace("ؤ", "و").replace("ئ", "ي")
+            .replace("ق", "ا")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    private fun normalizePhrases(phrases: List<String>): List<String> {
+        return phrases.map { normalizeArabic(it) }
+            .filter { it.isNotBlank() }
+            .distinct()
+    }
+
+    private fun containsAnyPhrase(text: String, phrases: List<String>): Boolean {
+        val normalizedText = normalizeArabic(text)
+        val wordCount = normalizedText.split(" ").count { it.isNotBlank() }
+        return phrases.any { phrase ->
+            val p = normalizeArabic(phrase)
+            p.isNotBlank() && (
+                normalizedText.contains(p) ||
+                    (wordCount > 1 && p.contains(normalizedText))
+            )
+        }
     }
 
     private fun fuzzyDetect(t: String): String {
-        val facePhrases = listOf("مين", "مين ده", "مين قدامي", "من قدامي")
-        val currencyPhrases = listOf("كام", "كم", "دول كام", "عدد", "قد ايه")
-        val ocrPhrases = listOf("مكتوب", "اقرا", "اقرالي", "النص")
-
-        var bestLabel = "unknown"
-        var bestScore = 0.55 // minimum threshold
+        val minimumScore = 0.64
 
         fun scorePhrases(phrases: List<String>): Double =
             phrases.maxOfOrNull { sequenceSimilarity(t, normalizeArabic(it)) } ?: 0.0
 
-        val faceScore = scorePhrases(facePhrases)
-        val currScore = scorePhrases(currencyPhrases)
-        val ocrScore  = scorePhrases(ocrPhrases)
+        val ocrScore = scorePhrases(normalizedOcrUtterances)
+        val currScore = scorePhrases(normalizedCurrencyUtterances)
+        val faceScore = scorePhrases(normalizedFaceUtterances)
+        val objectScore = scorePhrases(normalizedObjectUtterances)
 
-        if (faceScore > bestScore) { bestScore = faceScore; bestLabel = "face_who_is_in_front" }
-        if (currScore > bestScore) { bestScore = currScore; bestLabel = "currency_count" }
-        if (ocrScore  > bestScore) { bestLabel = "ocr_read_text" }
-
-        return bestLabel
+        return when {
+            ocrScore >= minimumScore && ocrScore >= currScore && ocrScore >= faceScore && ocrScore >= objectScore -> "ocr_read_text"
+            currScore >= minimumScore && currScore >= faceScore && currScore >= objectScore -> "currency_count"
+            faceScore >= minimumScore && faceScore >= objectScore -> "face_who_is_in_front"
+            objectScore >= minimumScore -> "object_obstacle_detection"
+            else -> "unknown"
+        }
     }
 
-    /** Simple character-level overlap ratio (like Python's SequenceMatcher) */
+    /** Normalized Levenshtein similarity for small ASR mistakes. */
     private fun sequenceSimilarity(a: String, b: String): Double {
         if (a.isEmpty() || b.isEmpty()) return 0.0
-        val longer = if (a.length >= b.length) a else b
-        val shorter = if (a.length < b.length) a else b
-        var matches = 0
-        shorter.forEach { c -> if (longer.contains(c)) matches++ }
-        return 2.0 * matches / (a.length + b.length)
+        if (a == b) return 1.0
+
+        val maxLength = maxOf(a.length, b.length)
+        val distance = levenshteinDistance(a, b)
+        return (1.0 - (distance.toDouble() / maxLength)).coerceIn(0.0, 1.0)
+    }
+
+    private fun levenshteinDistance(a: String, b: String): Int {
+        val previous = IntArray(b.length + 1) { it }
+        val current = IntArray(b.length + 1)
+
+        for (i in 1..a.length) {
+            current[0] = i
+            for (j in 1..b.length) {
+                val substitutionCost = if (a[i - 1] == b[j - 1]) 0 else 1
+                current[j] = minOf(
+                    previous[j] + 1,
+                    current[j - 1] + 1,
+                    previous[j - 1] + substitutionCost
+                )
+            }
+            for (j in previous.indices) {
+                previous[j] = current[j]
+            }
+        }
+
+        return previous[b.length]
     }
 
     private fun buildGrammarJson(): String {

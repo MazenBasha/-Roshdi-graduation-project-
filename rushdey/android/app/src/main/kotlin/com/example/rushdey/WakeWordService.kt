@@ -18,6 +18,7 @@ import org.json.JSONObject
 class WakeWordService : Service() {
     private var voskSpeechService: SpeechService? = null
     private var pytorchWakeWordEngine: WakeWordModelEngine? = null
+    private var voskTelemetryJob: Job? = null
     
     private var isListening = false
     private var hasDetectedInCurrentWindow = false
@@ -97,6 +98,7 @@ class WakeWordService : Service() {
             Log.i(TAG, "PyTorch Wake Word listening started")
         } else {
             Log.w(TAG, "PyTorch wake word failed; falling back to Vosk wake word")
+            currentEngine = "vosk"
             sendEvent(mapOf("type" to "status", "status" to "fallback_vosk"))
             CoroutineScope(Dispatchers.IO).launch {
                 initVoskAndStart()
@@ -145,12 +147,14 @@ class WakeWordService : Service() {
                         }
                         override fun onError(exception: Exception?) {
                             sendError(exception?.message ?: "Vosk Error")
+                            stopListening()
                         }
                         override fun onTimeout() {}
                     })
                 }
                 isListening = true
                 sendEvent(mapOf("type" to "status", "status" to "listening", "engine" to "vosk"))
+                startVoskTelemetry()
                 Log.i(TAG, "Vosk Wake Word listening started")
             } catch (e: Exception) {
                 sendError(e.message ?: "Failed to start Vosk")
@@ -165,17 +169,22 @@ class WakeWordService : Service() {
             val partial = JSONObject(hypothesis).optString("partial", "")
             val text = JSONObject(hypothesis).optString("text", "")
             val target = if (text.isNotBlank()) text else partial
+            val wakeMatch = WakeWordDetector.findWakeWordMatch(target)
             
-            if (target.contains("رشدي") && !hasDetectedInCurrentWindow) {
+            if (wakeMatch != null && !hasDetectedInCurrentWindow) {
                 hasDetectedInCurrentWindow = true
                 // Stop immediately to prevent multiple triggers
                 stopListening()
                 
-                Log.i(TAG, "Vosk Wake word detected! '$target'")
+                Log.i(
+                    TAG,
+                    "Vosk Wake word detected! raw='$target', alias='${wakeMatch.alias}', strategy=${wakeMatch.strategy}, score=${wakeMatch.score}"
+                )
+                sendEvent(mapOf("type" to "confidence", "confidence" to wakeMatch.score))
                 sendEvent(mapOf(
                     "type" to "detected",
-                    "wakeWord" to "رشدي",
-                    "confidence" to 1.0f
+                    "wakeWord" to wakeMatch.alias,
+                    "confidence" to wakeMatch.score
                 ))
             }
         } catch (_: Exception) {}
@@ -183,6 +192,7 @@ class WakeWordService : Service() {
     
     private fun stopListening() {
         if (!isListening) return
+        stopVoskTelemetry()
         pytorchWakeWordEngine?.stop()
         voskSpeechService?.apply {
             stop()
@@ -200,6 +210,26 @@ class WakeWordService : Service() {
             @Suppress("DEPRECATION")
             stopForeground(true)
         }
+    }
+
+    private fun startVoskTelemetry() {
+        stopVoskTelemetry()
+        // Vosk SpeechService does not expose raw PCM levels here, so this is an
+        // activity heartbeat that keeps the UI visibly alive while Vosk listens.
+        voskTelemetryJob = CoroutineScope(Dispatchers.Main).launch {
+            var tick = 0
+            while (isActive && isListening && currentEngine == "vosk") {
+                val level = (0.26f + ((tick % 5) * 0.06f)).coerceAtMost(0.5f)
+                sendEvent(mapOf("type" to "mic_level", "level" to level))
+                tick++
+                delay(350L)
+            }
+        }
+    }
+
+    private fun stopVoskTelemetry() {
+        voskTelemetryJob?.cancel()
+        voskTelemetryJob = null
     }
     
 

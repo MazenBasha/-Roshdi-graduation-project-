@@ -12,17 +12,26 @@ import kotlin.math.exp
 /**
  * On-device Egyptian currency recognition.
  *
- * The YOLO detector is tried first for scene/multi-note images. If it finds no
- * note, the full-note classifier is used as a fallback. The exported detector
- * graph was traced at 320x320; feeding 640x640 causes the anchor mismatch crash.
+ * The optional "YOLOv8" asset from the Updates branch is handled defensively:
+ * some exports return detector boxes, while the checked-in mobile export returns
+ * 9-class currency logits. Detector outputs are summed note-by-note; classifier
+ * outputs return the single best note value and still fall back safely.
  */
 class CurrencyEngine(private val context: Context) {
 
-    private var detectorModel: Module? = null
+    private var advancedModel: Module? = null
     private var classifierModel: Module? = null
     private var isReady = false
 
+    enum class Mode {
+        CLASSIC,
+        YOLO_V8
+    }
+
     private val detectorLabels = listOf("1_EGP", "5_EGP", "10_EGP", "20_EGP", "50_EGP", "100_EGP", "200_EGP")
+    private val advancedLabels = listOf(
+        "1_EGP", "5_EGP", "10_EGP", "10_EGP_NEW", "20_EGP", "20_EGP_NEW", "50_EGP", "100_EGP", "200_EGP"
+    )
     private val classifierLabels = listOf(
         "1_EGP", "5_EGP", "10_EGP", "10_EGP_NEW", "20_EGP", "20_EGP_NEW", "50_EGP", "100_EGP", "200_EGP"
     )
@@ -38,9 +47,11 @@ class CurrencyEngine(private val context: Context) {
         "200_EGP" to 200
     )
 
+    private val advancedClassifierInputSize = 224
     private val detectorInputSize = 320
     private val classifierInputSize = 224
     private val detectorConfidenceThreshold = 0.35f
+    private val advancedClassifierConfidenceThreshold = 0.35f
     private val classifierConfidenceThreshold = 0.60f
     private val iouThreshold = 0.5f
 
@@ -57,11 +68,16 @@ class CurrencyEngine(private val context: Context) {
         val arabicName: String
     )
 
+    private data class RawModelOutput(
+        val data: FloatArray,
+        val shape: LongArray
+    )
+
     fun initialize(): Boolean {
-        detectorModel = try {
+        advancedModel = try {
             Module.load(copyAssetToFile("best.ptl").absolutePath)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to load currency detector", e)
+            Log.e(TAG, "Failed to load advanced currency model", e)
             null
         }
 
@@ -72,13 +88,13 @@ class CurrencyEngine(private val context: Context) {
             null
         }
 
-        isReady = detectorModel != null || classifierModel != null
-        Log.i(TAG, "CurrencyEngine loaded detector=${detectorModel != null} classifier=${classifierModel != null}")
+        isReady = advancedModel != null || classifierModel != null
+        Log.i(TAG, "CurrencyEngine loaded advanced=${advancedModel != null} classifier=${classifierModel != null}")
         return isReady
     }
 
-    fun detect(imageBytes: ByteArray): CurrencyResult {
-        if (!isReady) {
+    fun detect(imageBytes: ByteArray, mode: Mode = Mode.CLASSIC): CurrencyResult {
+        if (!isReady || !isModeReady(mode)) {
             return CurrencyResult(emptyList(), 0, "\u0645\u062d\u0631\u0643 \u0627\u0644\u0639\u0645\u0644\u0629 \u063a\u064a\u0631 \u062c\u0627\u0647\u0632")
         }
 
@@ -86,15 +102,19 @@ class CurrencyEngine(private val context: Context) {
             ?: return CurrencyResult(emptyList(), 0, "\u062e\u0637\u0623 \u0641\u064a \u0642\u0631\u0627\u0621\u0629 \u0627\u0644\u0635\u0648\u0631\u0629")
 
         return try {
-            val detectorDetections = try {
-                runDetector(bitmap)
-            } catch (e: Exception) {
-                Log.e(TAG, "Currency detector failed", e)
-                emptyList()
-            }
+            if (mode == Mode.YOLO_V8) {
+                val detectorDetections = try {
+                    runDetector(bitmap)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Currency YOLOv8 detector failed", e)
+                    emptyList()
+                }
 
-            if (detectorDetections.isNotEmpty()) {
-                return resultFromDetections(detectorDetections, "detector")
+                if (detectorDetections.isNotEmpty()) {
+                    return resultFromDetections(detectorDetections, "yolo_v8")
+                }
+
+                Log.i(TAG, "Advanced currency model found no notes; falling back to classic classifier")
             }
 
             val classifierDetection = try {
@@ -114,58 +134,238 @@ class CurrencyEngine(private val context: Context) {
         }
     }
 
+    private fun isModeReady(mode: Mode): Boolean {
+        return when (mode) {
+            Mode.CLASSIC -> classifierModel != null
+            Mode.YOLO_V8 -> advancedModel != null || classifierModel != null
+        }
+    }
+
     private fun runDetector(bitmap: Bitmap): List<Detection> {
-        val localModel = detectorModel ?: return emptyList()
-        val resized = Bitmap.createScaledBitmap(bitmap, detectorInputSize, detectorInputSize, true)
+        val localModel = advancedModel ?: return emptyList()
+
+        runAdvancedModelAtSize(localModel, bitmap, advancedClassifierInputSize, normalize = true)?.let { output ->
+            decodeAdvancedOutput(output, advancedClassifierInputSize)?.let { detections ->
+                if (detections.isNotEmpty()) return detections
+            }
+        }
+
+        runAdvancedModelAtSize(localModel, bitmap, detectorInputSize, normalize = false)?.let { output ->
+            decodeAdvancedOutput(output, detectorInputSize)?.let { detections ->
+                if (detections.isNotEmpty()) return detections
+            }
+        }
+
+        return emptyList()
+    }
+
+    private fun runAdvancedModelAtSize(
+        model: Module,
+        bitmap: Bitmap,
+        inputSize: Int,
+        normalize: Boolean
+    ): RawModelOutput? {
+        val resized = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
         try {
-            val outputTensor = localModel.forward(IValue.from(bitmapToDetectorTensor(resized))).toTensor()
-            val outputData = outputTensor.dataAsFloatArray
-            val outputShape = outputTensor.shape()
-            if (outputShape.size < 3 || outputShape[1].toInt() < 4 + detectorLabels.size) {
-                Log.w(TAG, "Unexpected detector output shape=${outputShape.joinToString()}")
-                return emptyList()
+            val inputTensor = if (normalize) {
+                bitmapToNormalizedTensor(resized, inputSize)
+            } else {
+                bitmapToUnitTensor(resized, inputSize)
+            }
+            val outputTensor = model.forward(IValue.from(inputTensor)).toTensor()
+            return RawModelOutput(outputTensor.dataAsFloatArray, outputTensor.shape())
+        } catch (e: Exception) {
+            Log.w(TAG, "Advanced currency model failed at ${inputSize}x$inputSize", e)
+            return null
+        } finally {
+            resized.recycle()
+        }
+    }
+
+    private fun decodeAdvancedOutput(output: RawModelOutput, inputSize: Int): List<Detection>? {
+        Log.i(TAG, "Advanced currency output shape=${output.shape.joinToString()} input=$inputSize")
+
+        decodeClassifierOutput(output.data, output.shape, advancedLabels, advancedClassifierConfidenceThreshold)?.let {
+            return it
+        }
+        decodeYoloChannelFirstOutput(output.data, output.shape, inputSize)?.let {
+            return it
+        }
+        decodeYoloRowOutput(output.data, output.shape, inputSize)?.let {
+            return it
+        }
+
+        Log.w(TAG, "Unsupported advanced currency output shape=${output.shape.joinToString()}")
+        return null
+    }
+
+    private fun decodeClassifierOutput(
+        outputData: FloatArray,
+        outputShape: LongArray,
+        labels: List<String>,
+        threshold: Float
+    ): List<Detection>? {
+        val isFlatLogits = outputShape.size == 1 && outputData.size >= labels.size
+        val isBatchedLogits = outputShape.size == 2 &&
+            outputShape[0].toInt() == 1 &&
+            outputShape[1].toInt() >= labels.size
+        if (!isFlatLogits && !isBatchedLogits) return null
+
+        val (bestIndex, confidence) = bestSoftmaxClass(outputData, labels.size)
+        val label = labels[bestIndex]
+        val value = values[label] ?: 0
+        Log.i(TAG, "Advanced classifier currency=$label confidence=$confidence")
+
+        if (confidence < threshold || value <= 0) return emptyList()
+
+        return listOf(
+            Detection(
+                className = label,
+                confidence = confidence,
+                value = value,
+                box = floatArrayOf(0f, 0f, 1f, 1f)
+            )
+        )
+    }
+
+    private fun decodeYoloChannelFirstOutput(
+        outputData: FloatArray,
+        outputShape: LongArray,
+        inputSize: Int
+    ): List<Detection>? {
+        if (outputShape.size < 3) return null
+
+        val channels = outputShape[1].toInt()
+        val numAnchors = outputShape[2].toInt()
+        val labels = labelsForYoloChannels(channels) ?: return null
+        val detections = mutableListOf<Detection>()
+
+        for (i in 0 until numAnchors) {
+            val cx = outputData[i]
+            val cy = outputData[numAnchors + i]
+            val w = outputData[2 * numAnchors + i]
+            val h = outputData[3 * numAnchors + i]
+
+            var bestClassIdx = 0
+            var bestScore = 0f
+            for (c in labels.indices) {
+                val score = outputData[(4 + c) * numAnchors + i]
+                if (score > bestScore) {
+                    bestScore = score
+                    bestClassIdx = c
+                }
             }
 
-            val numClasses = detectorLabels.size
-            val numAnchors = outputShape[2].toInt()
-            val detections = mutableListOf<Detection>()
+            if (bestScore >= detectorConfidenceThreshold) {
+                val label = labels[bestClassIdx]
+                detections.add(
+                    Detection(
+                        className = label,
+                        confidence = bestScore,
+                        value = values[label] ?: 0,
+                        box = centerBoxToNormalizedBox(cx, cy, w, h, inputSize)
+                    )
+                )
+            }
+        }
 
-            for (i in 0 until numAnchors) {
-                val cx = outputData[i]
-                val cy = outputData[numAnchors + i]
-                val w = outputData[2 * numAnchors + i]
-                val h = outputData[3 * numAnchors + i]
+        return classAwareNms(detections, iouThreshold)
+    }
 
+    private fun decodeYoloRowOutput(
+        outputData: FloatArray,
+        outputShape: LongArray,
+        inputSize: Int
+    ): List<Detection>? {
+        val rows: Int
+        val cols: Int
+
+        when {
+            outputShape.size == 3 && outputShape[0].toInt() == 1 -> {
+                rows = outputShape[1].toInt()
+                cols = outputShape[2].toInt()
+            }
+            outputShape.size == 2 -> {
+                rows = outputShape[0].toInt()
+                cols = outputShape[1].toInt()
+            }
+            else -> return null
+        }
+
+        if (cols < 6 || rows <= 0) return null
+
+        val rowFormat = rowFormatForColumnCount(cols) ?: return null
+        val labels = rowFormat.labels
+        val detections = mutableListOf<Detection>()
+
+        for (row in 0 until rows) {
+            val offset = row * cols
+
+            val (classIndex, score) = if (rowFormat.classIndexColumn) {
+                outputData[offset + 5].toInt()
+                    .let { it to outputData[offset + 4] }
+            } else {
                 var bestClassIdx = 0
                 var bestScore = 0f
-                for (c in 0 until numClasses) {
-                    val score = outputData[(4 + c) * numAnchors + i]
-                    if (score > bestScore) {
-                        bestScore = score
+                for (c in labels.indices) {
+                    val classScore = outputData[offset + rowFormat.classStart + c]
+                    if (classScore > bestScore) {
+                        bestScore = classScore
                         bestClassIdx = c
                     }
                 }
-
-                if (bestScore >= detectorConfidenceThreshold) {
-                    val x1 = ((cx - w / 2f) / detectorInputSize).coerceIn(0f, 1f)
-                    val y1 = ((cy - h / 2f) / detectorInputSize).coerceIn(0f, 1f)
-                    val x2 = ((cx + w / 2f) / detectorInputSize).coerceIn(0f, 1f)
-                    val y2 = ((cy + h / 2f) / detectorInputSize).coerceIn(0f, 1f)
-                    val label = detectorLabels[bestClassIdx]
-                    detections.add(
-                        Detection(
-                            className = label,
-                            confidence = bestScore,
-                            value = values[label] ?: 0,
-                            box = floatArrayOf(x1, y1, x2, y2)
-                        )
-                    )
-                }
+                val confidence = rowFormat.objectnessIndex
+                    ?.let { outputData[offset + it] * bestScore }
+                    ?: bestScore
+                bestClassIdx to confidence
             }
 
-            return nms(detections, iouThreshold)
-        } finally {
-            resized.recycle()
+            if (score < detectorConfidenceThreshold) continue
+            if (classIndex !in labels.indices) continue
+
+            val label = labels[classIndex]
+            detections.add(
+                Detection(
+                    className = label,
+                    confidence = score,
+                    value = values[label] ?: 0,
+                    box = cornerBoxToNormalizedBox(
+                        outputData[offset],
+                        outputData[offset + 1],
+                        outputData[offset + 2],
+                        outputData[offset + 3],
+                        inputSize
+                    )
+                )
+            )
+        }
+
+        return classAwareNms(detections, iouThreshold)
+    }
+
+    private data class RowFormat(
+        val labels: List<String>,
+        val classStart: Int,
+        val objectnessIndex: Int?,
+        val classIndexColumn: Boolean = false
+    )
+
+    private fun rowFormatForColumnCount(cols: Int): RowFormat? {
+        return when (cols) {
+            6 -> RowFormat(detectorLabels, classStart = 5, objectnessIndex = 4, classIndexColumn = true)
+            4 + advancedLabels.size -> RowFormat(advancedLabels, classStart = 4, objectnessIndex = null)
+            5 + advancedLabels.size -> RowFormat(advancedLabels, classStart = 5, objectnessIndex = 4)
+            4 + detectorLabels.size -> RowFormat(detectorLabels, classStart = 4, objectnessIndex = null)
+            5 + detectorLabels.size -> RowFormat(detectorLabels, classStart = 5, objectnessIndex = 4)
+            else -> null
+        }
+    }
+
+    private fun labelsForYoloChannels(channels: Int): List<String>? {
+        return when (channels - 4) {
+            advancedLabels.size -> advancedLabels
+            detectorLabels.size -> detectorLabels
+            else -> null
         }
     }
 
@@ -220,33 +420,14 @@ class CurrencyEngine(private val context: Context) {
         return CurrencyResult(detections, total, if (total > 0) arabicCurrencyName(total) else noClearCurrencyText())
     }
 
-    private fun bitmapToDetectorTensor(bitmap: Bitmap): Tensor {
-        val pixels = IntArray(detectorInputSize * detectorInputSize)
-        bitmap.getPixels(pixels, 0, detectorInputSize, 0, 0, detectorInputSize, detectorInputSize)
-
-        val floatArray = FloatArray(3 * detectorInputSize * detectorInputSize)
-        for (i in pixels.indices) {
-            val pixel = pixels[i]
-            floatArray[i] = ((pixel shr 16) and 0xFF) / 255.0f
-            floatArray[detectorInputSize * detectorInputSize + i] = ((pixel shr 8) and 0xFF) / 255.0f
-            floatArray[2 * detectorInputSize * detectorInputSize + i] = (pixel and 0xFF) / 255.0f
-        }
-
-        return Tensor.fromBlob(
-            floatArray,
-            longArrayOf(1, 3, detectorInputSize.toLong(), detectorInputSize.toLong())
-        )
-    }
-
-    private fun bitmapToClassifierTensor(bitmap: Bitmap): Tensor {
-        val pixels = IntArray(classifierInputSize * classifierInputSize)
-        bitmap.getPixels(pixels, 0, classifierInputSize, 0, 0, classifierInputSize, classifierInputSize)
+    private fun bitmapToNormalizedTensor(bitmap: Bitmap, inputSize: Int): Tensor {
+        val pixels = IntArray(inputSize * inputSize)
+        bitmap.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
 
         val mean = floatArrayOf(0.485f, 0.456f, 0.406f)
         val std = floatArrayOf(0.229f, 0.224f, 0.225f)
-        val channelSize = classifierInputSize * classifierInputSize
+        val channelSize = inputSize * inputSize
         val floatArray = FloatArray(3 * channelSize)
-
         for (i in pixels.indices) {
             val pixel = pixels[i]
             val r = ((pixel shr 16) and 0xFF) / 255.0f
@@ -259,8 +440,39 @@ class CurrencyEngine(private val context: Context) {
 
         return Tensor.fromBlob(
             floatArray,
-            longArrayOf(1, 3, classifierInputSize.toLong(), classifierInputSize.toLong())
+            longArrayOf(1, 3, inputSize.toLong(), inputSize.toLong())
         )
+    }
+
+    private fun bitmapToClassifierTensor(bitmap: Bitmap): Tensor {
+        return bitmapToNormalizedTensor(bitmap, classifierInputSize)
+    }
+
+    private fun bitmapToUnitTensor(bitmap: Bitmap, inputSize: Int): Tensor {
+        val pixels = IntArray(inputSize * inputSize)
+        bitmap.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
+
+        val channelSize = inputSize * inputSize
+        val floatArray = FloatArray(3 * channelSize)
+        for (i in pixels.indices) {
+            val pixel = pixels[i]
+            floatArray[i] = ((pixel shr 16) and 0xFF) / 255.0f
+            floatArray[channelSize + i] = ((pixel shr 8) and 0xFF) / 255.0f
+            floatArray[2 * channelSize + i] = (pixel and 0xFF) / 255.0f
+        }
+
+        return Tensor.fromBlob(
+            floatArray,
+            longArrayOf(1, 3, inputSize.toLong(), inputSize.toLong())
+        )
+    }
+
+    private fun classAwareNms(detections: List<Detection>, threshold: Float): List<Detection> {
+        return detections
+            .groupBy { it.className }
+            .values
+            .flatMap { nms(it, threshold) }
+            .sortedByDescending { it.confidence }
     }
 
     private fun nms(detections: List<Detection>, threshold: Float): List<Detection> {
@@ -292,6 +504,34 @@ class CurrencyEngine(private val context: Context) {
         return if (union > 0f) intersection / union else 0f
     }
 
+    private fun centerBoxToNormalizedBox(cx: Float, cy: Float, w: Float, h: Float, inputSize: Int): FloatArray {
+        val scale = coordinateScale(inputSize, cx, cy, w, h)
+        val nx = cx / scale
+        val ny = cy / scale
+        val nw = w / scale
+        val nh = h / scale
+        return floatArrayOf(
+            (nx - nw / 2f).coerceIn(0f, 1f),
+            (ny - nh / 2f).coerceIn(0f, 1f),
+            (nx + nw / 2f).coerceIn(0f, 1f),
+            (ny + nh / 2f).coerceIn(0f, 1f)
+        )
+    }
+
+    private fun cornerBoxToNormalizedBox(x1: Float, y1: Float, x2: Float, y2: Float, inputSize: Int): FloatArray {
+        val scale = coordinateScale(inputSize, x1, y1, x2, y2)
+        return floatArrayOf(
+            (x1 / scale).coerceIn(0f, 1f),
+            (y1 / scale).coerceIn(0f, 1f),
+            (x2 / scale).coerceIn(0f, 1f),
+            (y2 / scale).coerceIn(0f, 1f)
+        )
+    }
+
+    private fun coordinateScale(inputSize: Int, vararg values: Float): Float {
+        return if (values.maxOrNull() ?: 0f <= 1.5f) 1f else inputSize.toFloat()
+    }
+
     private fun copyAssetToFile(assetName: String): java.io.File {
         val outFile = java.io.File(context.filesDir, assetName)
         if (outFile.exists() && outFile.length() > 0) return outFile
@@ -311,9 +551,9 @@ class CurrencyEngine(private val context: Context) {
         "\u0645\u0634 \u0634\u0627\u064a\u0641 \u0639\u0645\u0644\u0629 \u0648\u0627\u0636\u062d\u0629"
 
     fun release() {
-        detectorModel?.destroy()
+        advancedModel?.destroy()
         classifierModel?.destroy()
-        detectorModel = null
+        advancedModel = null
         classifierModel = null
         isReady = false
     }
